@@ -28,6 +28,7 @@ require_relative "utcp/protocols/udp"
 require_relative "utcp/protocols/mcp"
 require_relative "utcp/protocols/webrtc"
 require_relative "utcp/client"
+require_relative "utcp/code_mode"
 
 module UTCP
   register_auth("api_key", ApiKeyAuth)

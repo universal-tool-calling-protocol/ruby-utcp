@@ -18,6 +18,7 @@ STANDARD_SERVER_SCRIPTS := \
 
 STANDARD_CLIENT_SCRIPTS := \
 	examples/http.rb \
+	examples/code_mode.rb \
 	examples/sse.rb \
 	examples/streamable_http.rb \
 	examples/cli.rb \

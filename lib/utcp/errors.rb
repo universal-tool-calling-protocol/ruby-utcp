@@ -45,4 +45,18 @@ module UTCP
   end
   class SecurityError < Error; end
   class TimeoutError < ToolCallError; end
+
+  class CodeModeError < Error; end
+  class CodeModeSyntaxError < CodeModeError; end
+  class CodeModeTimeoutError < CodeModeError; end
+  class CodeModeLimitError < CodeModeError; end
+
+  class CodeModeExecutionError < CodeModeError
+    attr_reader :logs
+
+    def initialize(message, logs: [])
+      @logs = logs.dup.freeze
+      super(message)
+    end
+  end
 end

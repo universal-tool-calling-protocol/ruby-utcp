@@ -17,6 +17,17 @@ Each official transport has a client example. Network transports include a match
 | MCP | `mcp.rb` | `servers/mcp_stdio_server.rb`, launched by the client |
 | Text | `text.rb` | self-contained |
 
+## Code Mode
+
+`code_mode.rb` uses `CodeModeUtcpClient` to discover a tool, call it twice through `codemode.call_tool`, transform both responses inside the constrained Ruby runtime, and print the result with captured logs. It reuses the HTTP example server:
+
+```sh
+ruby -Ilib examples/servers/http_server.rb
+ruby -Ilib examples/code_mode.rb
+```
+
+The example is also included in `make examples`, `make demo`, and the corresponding `full-*` targets.
+
 For a network example, start the server in one terminal and the client in another:
 
 ```sh

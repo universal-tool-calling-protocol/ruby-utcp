@@ -289,6 +289,28 @@ client.search_tools("weather forecast", limit: 5, any_of_tags_required: ["weathe
 
 Pass objects that implement the repository or search interfaces through `tool_repository` and `tool_search_strategy` to replace the defaults.
 
+## Code Mode
+
+`CodeModeUtcpClient` can run a multi-step Ruby workflow as one call. Tools are invoked through the explicit `codemode` runtime API, and the final expression (or an explicit `return`) becomes the result:
+
+```ruby
+client = UTCP::CodeModeUtcpClient.create(config: config)
+
+execution = client.call_tool_chain(<<~'RUBY', timeout: 30)
+  weather = codemode.call_tool("weather_service.get_weather", location: "Warsaw")
+  alerts = weather["alerts"].select { |alert| alert["severity"] == "high" }
+  puts "Found #{alerts.length} high-severity alerts"
+  { temperature: weather["temperature"], alerts: alerts }
+RUBY
+
+puts execution["result"]
+puts execution["logs"]
+```
+
+Use `codemode.call_tool_stream` to collect a streaming call into an array. `codemode.search_tools`, `codemode.get_tool_interface`, and `codemode.interfaces` provide progressive discovery inside a workflow. `codemode.get(value, key, default)` safely reads dynamic results, and `get_all_tools_ruby_interfaces` provides the tool catalog outside the sandbox.
+
+Code Mode accepts a constrained Ruby subset for local variables, JSON-like literals, arithmetic, conditionals, loops, indexing, and common collection transforms. It is interpreted without `eval`; filesystem, process, constant, reflection, import, and direct network APIs are not exposed. Executions also have code-size, step, result-size, log-size, and wall-clock limits. External effects remain possible through the UTCP tools that you deliberately register.
+
 ## Custom protocol plugins
 
 Register a call-template class and a protocol implementation before creating a client:
