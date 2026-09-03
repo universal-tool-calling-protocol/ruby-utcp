@@ -1,0 +1,143 @@
+# frozen_string_literal: true
+
+module UTCP
+  class TCPProtocol < CommunicationProtocol
+    include SocketSupport
+
+    def initialize(socket_factory: nil)
+      @socket_factory = socket_factory || lambda do |host, port, timeout|
+        Socket.tcp(host, port, connect_timeout: timeout)
+      end
+    end
+
+    def register_manual(client, template)
+      assert_template!(template)
+      response = exchange(template, JSON.generate("type" => "utcp"))
+      success(template, manual_from_payload(template, response, source: "TCP discovery response"))
+    rescue StandardError => error
+      client.logger.warn("Unable to register TCP manual #{template.name.inspect}: #{error.message}")
+      failure(template, error)
+    end
+
+    def call_tool(_client, tool_name, tool_args, template)
+      assert_template!(template)
+      exchange(template, format_socket_message(template, tool_args))
+    rescue Error
+      raise
+    rescue StandardError => error
+      raise ToolCallError.new("TCP tool #{tool_name.inspect} failed: #{error.message}", tool_name: tool_name)
+    end
+
+    private
+
+    def assert_template!(template)
+      return if template.is_a?(TcpCallTemplate)
+
+      raise ValidationError, "TCP protocol requires a TcpCallTemplate"
+    end
+
+    def exchange(template, message)
+      timeout = socket_timeout_seconds(template)
+      socket = @socket_factory.call(template.host, template.port, timeout)
+      socket.write(frame_message(message.to_s.b, template))
+      payload = read_framed(socket, template, timeout)
+      decode_socket_payload(payload, template.response_byte_format)
+    rescue Timeout::Error, Errno::ETIMEDOUT => error
+      raise TimeoutError, "TCP request timed out: #{error.message}"
+    rescue Error
+      raise
+    rescue SocketError, IOError, SystemCallError => error
+      raise ToolCallError, "TCP request failed: #{error.message}"
+    ensure
+      socket.close if socket && !socket.closed?
+    end
+
+    def frame_message(message, template)
+      case template.framing_strategy
+      when "length_prefix"
+        pack = {
+          [1, "big"] => "C", [1, "little"] => "C",
+          [2, "big"] => "n", [2, "little"] => "v",
+          [4, "big"] => "N", [4, "little"] => "V",
+          [8, "big"] => "Q>", [8, "little"] => "Q<"
+        }.fetch([template.length_prefix_bytes, template.length_prefix_endian])
+        [message.bytesize].pack(pack) + message
+      when "delimiter"
+        message + escaped_delimiter(template.message_delimiter, template.interpret_escape_sequences)
+      else
+        message
+      end
+    end
+
+    def read_framed(socket, template, timeout)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+      case template.framing_strategy
+      when "length_prefix"
+        prefix = read_exact(socket, template.length_prefix_bytes, deadline)
+        unpack = {
+          [1, "big"] => "C", [1, "little"] => "C",
+          [2, "big"] => "n", [2, "little"] => "v",
+          [4, "big"] => "N", [4, "little"] => "V",
+          [8, "big"] => "Q>", [8, "little"] => "Q<"
+        }.fetch([template.length_prefix_bytes, template.length_prefix_endian])
+        length = prefix.unpack1(unpack)
+        raise ToolCallError, "TCP response exceeds max_response_size" if length > template.max_response_size
+
+        read_exact(socket, length, deadline)
+      when "delimiter"
+        read_until(socket, escaped_delimiter(template.message_delimiter, template.interpret_escape_sequences),
+                   template.max_response_size, deadline)
+      when "fixed_length"
+        read_exact(socket, template.fixed_message_length, deadline)
+      when "stream"
+        read_stream(socket, template.max_response_size, deadline)
+      end
+    end
+
+    def read_exact(socket, length, deadline)
+      result = +"".b
+      while result.bytesize < length
+        wait_readable!(socket, deadline, "TCP read")
+        chunk = socket.readpartial(length - result.bytesize)
+        raise ToolCallError, "TCP connection closed before the complete response" if chunk.nil? || chunk.empty?
+
+        result << chunk
+      end
+      result
+    rescue EOFError
+      raise ToolCallError, "TCP connection closed before the complete response"
+    end
+
+    def read_until(socket, delimiter, maximum, deadline)
+      raise ValidationError, "message_delimiter cannot be empty" if delimiter.empty?
+
+      result = +"".b
+      until result.end_with?(delimiter)
+        raise ToolCallError, "TCP response exceeds max_response_size" if result.bytesize >= maximum
+
+        wait_readable!(socket, deadline, "TCP read")
+        result << socket.readpartial([4096, maximum - result.bytesize].min)
+      end
+      result.byteslice(0, result.bytesize - delimiter.bytesize)
+    rescue EOFError
+      raise ToolCallError, "TCP connection closed before the message delimiter"
+    end
+
+    def read_stream(socket, maximum, deadline)
+      result = +"".b
+      while result.bytesize < maximum
+        remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        break unless remaining.positive? && IO.select([socket], nil, nil, remaining)
+
+        begin
+          result << socket.readpartial([4096, maximum - result.bytesize].min)
+        rescue EOFError
+          break
+        end
+      end
+      result
+    end
+  end
+  TcpCommunicationProtocol = TCPProtocol
+  TCPCommunicationProtocol = TCPProtocol
+end
