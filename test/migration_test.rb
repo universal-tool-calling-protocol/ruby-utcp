@@ -38,7 +38,7 @@ class MigrationTest < Minitest::Test
     migrated = UTCP::Migration.manual_v0_1_to_v1_1(old)
     manual = UTCP::Manual.from_h(migrated)
 
-    assert_equal "1.1.1", manual.utcp_version
+    assert_equal UTCP::VERSION, manual.utcp_version
     assert_equal "Weather", manual.info["title"]
     assert_equal "object", manual.tools.first.inputs.type
     assert_instance_of UTCP::HttpCallTemplate, manual.tools.first.tool_call_template
@@ -49,4 +49,3 @@ class MigrationTest < Minitest::Test
     refute UTCP::Migration.v0_1_manual?("tools" => [{ "tool_call_template" => {} }])
   end
 end
-

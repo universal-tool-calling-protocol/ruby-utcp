@@ -16,10 +16,10 @@ Or build this checkout:
 
 ```sh
 gem build ruby-utcp.gemspec
-gem install ./ruby-utcp-1.1.0.gem
+gem install "./ruby-utcp-$(ruby -Ilib -rutcp/version -e 'print UTCP::VERSION').gem"
 ```
 
-Ruby 2.6 or newer is supported for the core and 11 transports. The WebRTC default backend uses the optional `webrtc-ruby` gem, which requires Ruby 3.1 and `libdatachannel`; an application can instead inject its own peer adapter. The gRPC transport similarly loads the optional `grpc` gem only when used. There are no mandatory runtime dependencies outside Ruby's standard library.
+Ruby 2.6 or newer is supported for the core and 11 transports. The WebRTC default backend uses the optional `webrtc-ruby` gem, which requires Ruby 3.1 and `libdatachannel`; an application can instead inject its own peer adapter. The gRPC transport similarly loads the optional `grpc` gem only when used. `base64` and `logger` are declared runtime dependencies so Bundler can load them on Ruby versions where they are distributed as separate gems; the remaining core libraries come with Ruby.
 
 ## Quick start
 
@@ -229,6 +229,10 @@ MCP sessions implement initialization, notifications, `tools/list`, `tools/call`
 }
 ```
 
+Sessions and resource mappings are isolated per client. Closing one client does not close another client's sessions, even when manual and server names match. Tool and resource discovery follows all result pages. An MCP result with `isError: true` raises `UTCP::ToolCallError`; the original result is available in `error.response_body`.
+
+For stdio, `timeout` bounds the complete request write and response read, including partial lines and intervening notifications. Messages are limited to 16 MiB, and stderr is drained while retaining only its last 64 KiB. Call `client.close` when finished to release server processes.
+
 ### WebRTC
 
 WebRTC follows the reference signaling contract: `POST /connect` exchanges SDP and returns `sdp`, `candidates`, and `tools`; `POST /candidate` exchanges ICE candidates. DataChannel requests are JSON envelopes containing `id`, `tool`, and `args`, and responses correlate the same `id` with `result`.
@@ -311,6 +315,8 @@ Use `codemode.call_tool_stream` to collect a streaming call into an array. `code
 
 Code Mode accepts a constrained Ruby subset for local variables, JSON-like literals, arithmetic, conditionals, loops, indexing, and common collection transforms. It is interpreted without `eval`; filesystem, process, constant, reflection, import, and direct network APIs are not exposed. Executions also have code-size, step, result-size, log-size, and wall-clock limits. External effects remain possible through the UTCP tools that you deliberately register.
 
+The 1 MiB value budget includes numeric payloads as well as strings. Integer powers and products are checked before allocating their results, and non-finite floating-point results are rejected. Power checks use a conservative size estimate and can reject expressions close to the limit.
+
 ## Custom protocol plugins
 
 Register a call-template class and a protocol implementation before creating a client:
@@ -348,6 +354,11 @@ UTCP.register_protocol("queue", QueueProtocol.new)
 ## Development
 
 ```sh
-rake test
+bundle install
+bundle exec rake test
+bundle exec rake coverage
+bundle exec make standard-demo
 gem build ruby-utcp.gemspec
 ```
+
+CI runs the tests and gem build on Ruby 2.6, 2.7, 3.0–3.4, and 4.0. A separate Ruby 3.4 job runs the local transport examples and enforces minimum coverage of 75% of executable lines and 45% of branches. The standard demo uses WEBrick, included as a development dependency; native gRPC/WebRTC backends remain optional.

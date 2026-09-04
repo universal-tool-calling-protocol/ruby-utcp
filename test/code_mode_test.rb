@@ -148,6 +148,45 @@ class CodeModeTest < Minitest::Test
     end
   end
 
+  def test_rejects_oversized_integer_powers_even_when_result_is_discarded
+    %w[2 -2].each do |base|
+      [10_000_000, -10_000_000].each do |exponent|
+        error = assert_raises(UTCP::CodeModeLimitError) do
+          @client.call_tool_chain("(#{base}) ** #{exponent}; 0", max_steps: 100)
+        end
+        assert_match(/Integer power/, error.message)
+      end
+    end
+  end
+
+  def test_allows_small_and_constant_size_powers
+    execution = @client.call_tool_chain("[2 ** 8, 2 ** -3, (-2) ** 3, 0 ** 10000000, 1 ** 10000000, (-1) ** 10000000]")
+    assert_equal [256, Rational(1, 8), -8, 0, 1, 1], execution["result"]
+  end
+
+  def test_rejects_oversized_integer_products
+    error = assert_raises(UTCP::CodeModeLimitError) do
+      @client.call_tool_chain("value = 2 ** #{UTCP::CodeMode::MAX_INTEGER_BITS / 2}; value * value; 0")
+    end
+    assert_match(/Integer product/, error.message)
+  end
+
+  def test_large_numbers_returned_by_tools_count_toward_value_budget
+    value = 1 << UTCP::CodeMode::MAX_INTEGER_BITS
+    @client.define_singleton_method(:call_tool) { |_name, _arguments| value }
+    assert_raises(UTCP::CodeModeLimitError) { @client.call_tool_chain('codemode.call_tool("calc.add")') }
+  end
+
+  def test_numeric_budget_is_shared_by_values_in_a_collection
+    value = 1 << (UTCP::CodeMode::MAX_INTEGER_BITS / 2)
+    @client.define_singleton_method(:call_tool) { |_name, _arguments| [value, value] }
+    assert_raises(UTCP::CodeModeLimitError) { @client.call_tool_chain('codemode.call_tool("calc.add")') }
+  end
+
+  def test_rejects_non_finite_numbers
+    assert_raises(UTCP::CodeModeLimitError) { @client.call_tool_chain("1.0e300 * 1.0e300") }
+  end
+
   def test_wraps_tool_failures_with_captured_logs
     error = assert_raises(UTCP::CodeModeExecutionError) do
       @client.call_tool_chain("puts 'starting'\ncodemode.call_tool('calc.fail')")

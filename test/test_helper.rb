@@ -3,6 +3,7 @@
 $LOAD_PATH.unshift(File.expand_path("../lib", __dir__))
 
 require "minitest/autorun"
+require_relative "coverage_helper" if ENV["COVERAGE"] == "1"
 require "tempfile"
 require "tmpdir"
 require "utcp"

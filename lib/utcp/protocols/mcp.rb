@@ -4,7 +4,16 @@ require "open3"
 
 module UTCP
   class MCPStdioSession
-    def initialize(config, timeout)
+    MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+    MAX_STDERR_BYTES = 64 * 1024
+
+    def initialize(config, timeout, max_message_bytes: MAX_MESSAGE_BYTES)
+      @timeout = Float(timeout)
+      raise ValidationError, "MCP timeout must be finite and greater than zero" unless @timeout.finite? && @timeout.positive?
+
+      @max_message_bytes = Integer(max_message_bytes)
+      raise ValidationError, "MCP message limit must be greater than zero" unless @max_message_bytes.positive?
+
       command = config["command"]
       command = command.first if command.is_a?(Array)
       raise ValidationError, "MCP stdio server requires command" if command.to_s.empty?
@@ -14,20 +23,26 @@ module UTCP
       options = { pgroup: true }
       options[:chdir] = config["cwd"] || config["workingDir"] if config["cwd"] || config["workingDir"]
       @stdin, @stdout, @stderr, @wait_thread = Open3.popen3(environment, command.to_s, *args, options)
-      @timeout = timeout
+      @stdin.binmode
+      @stdout.binmode
+      @stderr.binmode
       @next_id = 0
       @mutex = Mutex.new
-      @stderr_reader = Thread.new { @stderr.read }
+      @read_buffer = +"".b
+      @stderr_buffer = +"".b
+      @stderr_mutex = Mutex.new
+      @stderr_reader = Thread.new { drain_stderr }
     end
 
     def request(method, params = nil)
       @mutex.synchronize do
+        deadline = monotonic_now + @timeout
         identifier = (@next_id += 1)
         message = { "jsonrpc" => "2.0", "id" => identifier, "method" => method }
         message["params"] = params unless params.nil?
-        write_message(message)
+        write_message(message, deadline)
         loop do
-          response = read_message
+          response = read_message(deadline)
           next unless response["id"] == identifier
           raise ToolCallError, "MCP error #{response["error"].inspect}" if response["error"]
 
@@ -40,7 +55,7 @@ module UTCP
       @mutex.synchronize do
         message = { "jsonrpc" => "2.0", "method" => method }
         message["params"] = params unless params.nil?
-        write_message(message)
+        write_message(message, monotonic_now + @timeout)
       end
       nil
     end
@@ -50,33 +65,93 @@ module UTCP
       Process.kill("TERM", -@wait_thread.pid) if @wait_thread&.alive?
       @wait_thread.join(1) if @wait_thread
       Process.kill("KILL", -@wait_thread.pid) if @wait_thread&.alive?
+      @wait_thread.join(1) if @wait_thread
     rescue Errno::ESRCH, Errno::EPERM, IOError
       nil
     ensure
       @stdout.close unless @stdout.closed?
+      @stderr_reader.join(1) if @stderr_reader
       @stderr.close unless @stderr.closed?
       @stderr_reader.kill if @stderr_reader&.alive?
     end
 
+    def stderr_output
+      @stderr_mutex.synchronize { @stderr_buffer.dup }
+    end
+
     private
 
-    def write_message(message)
-      @stdin.write(JSON.generate(message) + "\n")
-      @stdin.flush
+    def write_message(message, deadline)
+      data = (JSON.generate(message) + "\n").b
+      raise SerializerValidationError, "MCP stdio message exceeds #{@max_message_bytes} bytes" if data.bytesize > @max_message_bytes
+
+      offset = 0
+      while offset < data.bytesize
+        remaining_time(deadline)
+        written = @stdin.write_nonblock(data.byteslice(offset, 4096), exception: false)
+        if written == :wait_writable
+          wait_for_io(deadline, writable: true)
+        else
+          offset += written
+        end
+      end
     rescue Errno::EPIPE, IOError => error
       raise ToolCallError, "MCP stdio write failed: #{error.message}"
     end
 
-    def read_message
-      ready = IO.select([@stdout], nil, nil, @timeout)
-      raise TimeoutError, "MCP stdio response timed out" unless ready
+    def read_message(deadline)
+      loop do
+        remaining_time(deadline)
+        if (index = @read_buffer.index("\n"))
+          response = JSON.parse(@read_buffer.slice!(0, index + 1))
+          raise SerializerValidationError, "MCP stdio response must be an object" unless response.is_a?(Hash)
 
-      line = @stdout.gets
-      raise ToolCallError, "MCP stdio server closed the stream" unless line
+          return response
+        end
+        if @read_buffer.bytesize >= @max_message_bytes
+          raise SerializerValidationError, "MCP stdio message exceeds #{@max_message_bytes} bytes"
+        end
 
-      JSON.parse(line)
+        chunk = @stdout.read_nonblock([4096, @max_message_bytes - @read_buffer.bytesize].min, exception: false)
+        case chunk
+        when :wait_readable then wait_for_io(deadline)
+        when nil then raise ToolCallError, "MCP stdio server closed the stream"
+        else @read_buffer << chunk
+        end
+      end
     rescue JSON::ParserError => error
       raise SerializerValidationError, "Invalid MCP stdio JSON: #{error.message}"
+    end
+
+    def monotonic_now
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    end
+
+    def remaining_time(deadline)
+      remaining = deadline - monotonic_now
+      raise TimeoutError, "MCP stdio request timed out" unless remaining.positive?
+
+      remaining
+    end
+
+    def wait_for_io(deadline, writable: false)
+      readers, writers = writable ? [nil, [@stdin]] : [[@stdout], nil]
+      ready = IO.select(readers, writers, nil, remaining_time(deadline))
+      raise TimeoutError, "MCP stdio request timed out" unless ready
+    end
+
+    def drain_stderr
+      loop do
+        chunk = @stderr.readpartial(4096)
+        @stderr_mutex.synchronize do
+          @stderr_buffer << chunk
+          if @stderr_buffer.bytesize > MAX_STDERR_BYTES
+            @stderr_buffer = @stderr_buffer.byteslice(-MAX_STDERR_BYTES, MAX_STDERR_BYTES)
+          end
+        end
+      end
+    rescue EOFError, IOError
+      nil
     end
   end
 
@@ -156,10 +231,9 @@ module UTCP
       errors = []
       template.servers.each do |server_name, config|
         begin
-          session = session_for(template, server_name, config)
+          session = session_for(client, template, server_name, config)
           initialize_session(session, template)
-          result = session.request("tools/list", {}) || {}
-          Array(result["tools"]).each do |tool|
+          each_list_item(session, "tools/list", "tools") do |tool|
             tools << Tool.new(
               name: "#{server_name}.#{tool.fetch("name")}",
               description: tool["description"].to_s,
@@ -168,11 +242,12 @@ module UTCP
               tool_call_template: template
             )
           end
-          add_resource_tools(template, server_name, session, tools) if template.register_resources_as_tools
+          add_resource_tools(client, template, server_name, session, tools) if template.register_resources_as_tools
         rescue StandardError => error
           errors << "#{server_name}: #{error.message}"
         end
       end
+      deregister_manual(client, template) unless errors.empty?
       manual = Manual.new(utcp_version: VERSION, manual_version: "1.0.0", tools: tools)
       RegisterManualResult.new(
         manual_call_template: template,
@@ -185,29 +260,28 @@ module UTCP
       failure(template, error)
     end
 
-    def deregister_manual(_client, template)
-      prefix = "#{template.name}\0"
+    def deregister_manual(client, template)
       sessions = @sessions_mutex.synchronize do
-        keys = @sessions.keys.select { |key| key.start_with?(prefix) }
+        keys = @sessions.keys.select { |owner, name, _server| owner.equal?(client) && name == template.name }
+        @resources.delete_if { |(owner, name, _server, _resource), _value| owner.equal?(client) && name == template.name }
         keys.map { |key| @sessions.delete(key) }
       end
       sessions.each(&:close)
-      @resources.delete_if { |key, _value| key.start_with?(prefix) }
       nil
     end
 
-    def call_tool(_client, tool_name, tool_args, template)
+    def call_tool(client, tool_name, tool_args, template)
       assert_mcp_template!(template)
       server_name, local_name = parse_tool_name(tool_name, template)
       config = template.servers.fetch(server_name)
-      session = session_for(template, server_name, config)
-      resource_uri = @resources[resource_key(template, server_name, local_name)]
+      session = session_for(client, template, server_name, config)
+      resource_uri = @sessions_mutex.synchronize { @resources[resource_key(client, template, server_name, local_name)] }
       result = if resource_uri
                  session.request("resources/read", "uri" => resource_uri)
                else
                  session.request("tools/call", "name" => local_name, "arguments" => Utils.stringify_keys(tool_args || {}))
                end
-      process_mcp_result(result)
+      process_mcp_result(result, tool_name: tool_name)
     rescue Error
       raise
     rescue StandardError => error
@@ -251,8 +325,8 @@ module UTCP
       raise ValidationError, "MCP protocol requires a McpCallTemplate"
     end
 
-    def session_for(template, server_name, config)
-      key = "#{template.name}\0#{server_name}"
+    def session_for(client, template, server_name, config)
+      key = [client, template.name, server_name]
       @sessions_mutex.synchronize do
         @sessions[key] ||= if @session_factory
                             @session_factory.call(server_name, config, template)
@@ -273,30 +347,42 @@ module UTCP
       session.notify("notifications/initialized", {})
     end
 
-    def add_resource_tools(template, server_name, session, tools)
+    def each_list_item(session, method, collection)
       cursor = nil
+      seen = {}
       loop do
-        params = cursor ? { "cursor" => cursor } : {}
-        result = session.request("resources/list", params) || {}
-        Array(result["resources"]).each do |resource|
-          safe_name = resource.fetch("name", resource.fetch("uri")).to_s.gsub(/[^[:alnum:]_]/, "_")
-          local_name = "resource_#{safe_name}"
-          @resources[resource_key(template, server_name, local_name)] = resource.fetch("uri")
-          tools << Tool.new(
-            name: "#{server_name}.#{local_name}",
-            description: "Read MCP resource: #{resource["description"] || resource["name"] || resource["uri"]}",
-            inputs: { "type" => "object", "properties" => {} },
-            outputs: { "type" => "object" },
-            tool_call_template: template
-          )
-        end
+        params = cursor.nil? ? {} : { "cursor" => cursor }
+        result = Utils.hash!(session.request(method, params) || {}, "MCP #{method} result")
+        Utils.array!(result.fetch(collection, []), "MCP #{collection}").each { |item| yield item }
         cursor = result["nextCursor"]
-        break if cursor.nil? || cursor.empty?
+        break if cursor.nil?
+        unless cursor.is_a?(String) && !seen.key?(cursor)
+          raise SerializerValidationError, "MCP #{method} returned an invalid or repeated cursor"
+        end
+
+        seen[cursor] = true
       end
     end
 
-    def resource_key(template, server_name, local_name)
-      "#{template.name}\0#{server_name}\0#{local_name}"
+    def add_resource_tools(client, template, server_name, session, tools)
+      each_list_item(session, "resources/list", "resources") do |resource|
+        safe_name = resource.fetch("name", resource.fetch("uri")).to_s.gsub(/[^[:alnum:]_]/, "_")
+        local_name = "resource_#{safe_name}"
+        @sessions_mutex.synchronize do
+          @resources[resource_key(client, template, server_name, local_name)] = resource.fetch("uri")
+        end
+        tools << Tool.new(
+          name: "#{server_name}.#{local_name}",
+          description: "Read MCP resource: #{resource["description"] || resource["name"] || resource["uri"]}",
+          inputs: { "type" => "object", "properties" => {} },
+          outputs: { "type" => "object" },
+          tool_call_template: template
+        )
+      end
+    end
+
+    def resource_key(client, template, server_name, local_name)
+      [client, template.name, server_name, local_name]
     end
 
     def parse_tool_name(tool_name, template)
@@ -311,8 +397,15 @@ module UTCP
       end
     end
 
-    def process_mcp_result(result)
+    def process_mcp_result(result, tool_name: nil)
       return result unless result.is_a?(Hash)
+      if result["isError"]
+        details = Array(result["content"]).select { |item| item.is_a?(Hash) && item["type"] == "text" }
+                                          .map { |item| item["text"].to_s }.join("\n")
+        message = "MCP tool #{tool_name.inspect} failed"
+        message += ": #{details}" unless details.empty?
+        raise ToolCallError.new(message, tool_name: tool_name, response_body: Utils.deep_copy(result))
+      end
       return result["structuredContent"] if result.key?("structuredContent")
       return result if result.key?("contents")
 

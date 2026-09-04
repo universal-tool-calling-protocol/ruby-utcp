@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Isolate MCP sessions and resource mappings between clients and clean up failed registrations.
+- Follow MCP tool/resource pagination and raise `ToolCallError` for tool failures, preserving the original payload.
+- Enforce stdio deadlines across partial reads, notifications, and blocked writes; bound message and stderr buffers.
+- Bound Code Mode integer powers, products, and numeric results, including aggregate tool-result budgets.
+- Declare `base64` and `logger` runtime dependencies for Bundler compatibility.
+- Add regression tests, coverage checks, a Ruby version CI matrix, and local transport integration checks.
+
 ## 1.1.0
 
 - Initial Ruby implementation of the UTCP 1.1 client and data model.
