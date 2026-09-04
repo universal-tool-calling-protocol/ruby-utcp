@@ -21,6 +21,7 @@ Gem::Specification.new do |spec|
   spec.files = Dir.chdir(__dir__) do
     Dir[
       "lib/**/*.rb", "examples/**/*.rb", "examples/**/*.py", "examples/**/*.txt",
+      "patches/*.patch", "patches/*.md",
       "proto/**/*.proto", "README.md", "LICENSE", "CHANGELOG.md", "Makefile"
     ]
   end

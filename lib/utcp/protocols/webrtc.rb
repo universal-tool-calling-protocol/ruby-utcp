@@ -11,7 +11,8 @@ module UTCP
       @condition = ConditionVariable.new
       @responses = {}
       @candidates = []
-      configuration = template.ice_servers.empty? ? nil : { ice_servers: template.ice_servers }
+      configuration = { disable_auto_negotiation: true }
+      configuration[:ice_servers] = template.ice_servers unless template.ice_servers.empty?
       @connection = WebRTC::RTCPeerConnection.new(configuration)
       install_candidate_handler
       @channel = @connection.create_data_channel(template.data_channel_name)
@@ -23,9 +24,9 @@ module UTCP
 
     def connect
       offer = @connection.create_offer.await
-      @connection.set_local_description(offer).await
+      # webrtc-ruby creates and installs the local offer in one native operation.
       wait_for_ice_gathering
-      response = post_json("connect", "peer_id" => @template.peer_id, "sdp" => @connection.local_description.sdp)
+      response = post_json("connect", "peer_id" => @template.peer_id, "sdp" => offer.sdp)
       answer = WebRTC::RTCSessionDescription.new(type: :answer, sdp: response.fetch("sdp"))
       @connection.set_remote_description(answer).await
       Array(response["candidates"]).each do |candidate|
@@ -157,7 +158,7 @@ module UTCP
 
     def register_manual(client, template)
       assert_webrtc_template!(template)
-      response = peer_for(template).connect
+      response = peer_for(client, template).connect
       payload = if response.is_a?(Hash) && response.key?("tools") && !response.key?("utcp_version")
                   {
                     "utcp_version" => VERSION,
@@ -169,20 +170,24 @@ module UTCP
                 end
       success(template, manual_from_payload(template, payload, source: "WebRTC signaling response"))
     rescue StandardError => error
+      deregister_manual(client, template)
       client.logger.warn("Unable to register WebRTC manual #{template.name.inspect}: #{error.message}")
       failure(template, error)
     end
 
-    def deregister_manual(_client, template)
-      peer = @mutex.synchronize { @peers.delete(peer_key(template)) }
-      peer&.close
+    def deregister_manual(client, template)
+      peers = @mutex.synchronize do
+        keys = @peers.keys.select { |owner, name, *_rest| owner.equal?(client) && name == template.name }
+        keys.map { |key| @peers.delete(key) }
+      end
+      peers.each(&:close)
       nil
     end
 
-    def call_tool(_client, tool_name, tool_args, template)
+    def call_tool(client, tool_name, tool_args, template)
       assert_webrtc_template!(template)
       identifier = SecureRandom.uuid
-      peer_for(template).request(
+      peer_for(client, template).request(
         {
           "id" => identifier,
           "tool" => tool_name.to_s.split(".").last,
@@ -204,12 +209,12 @@ module UTCP
       raise ValidationError, "WebRTC protocol requires a WebRtcCallTemplate"
     end
 
-    def peer_for(template)
-      @mutex.synchronize { @peers[peer_key(template)] ||= @peer_factory.call(template) }
+    def peer_for(client, template)
+      @mutex.synchronize { @peers[peer_key(client, template)] ||= @peer_factory.call(template) }
     end
 
-    def peer_key(template)
-      [template.name, template.signaling_server, template.peer_id, template.data_channel_name].join("\0")
+    def peer_key(client, template)
+      [client, template.name, template.signaling_server, template.peer_id, template.data_channel_name]
     end
   end
   WebrtcCommunicationProtocol = WebRTCProtocol

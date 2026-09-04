@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
 module UTCP
-  VERSION = "1.1.2"
+  VERSION = "1.1.3"
 end
 

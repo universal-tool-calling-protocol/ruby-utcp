@@ -10,7 +10,7 @@ Minitest.after_run do
   lines = files.values.flat_map { |data| data[:lines].compact }
   branches = files.values.flat_map { |data| data[:branches].values.flat_map(&:values) }
   totals = { "line" => lines, "branch" => branches }
-  minimums = { "line" => 75.0, "branch" => 45.0 }
+  minimums = { "line" => 80.0, "branch" => 60.0 }
   failures = []
 
   totals.each do |kind, counts|

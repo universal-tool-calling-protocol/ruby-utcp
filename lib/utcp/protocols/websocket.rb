@@ -36,6 +36,9 @@ module UTCP
       @closed = false
       open_socket
       handshake(headers, protocol)
+    rescue StandardError
+      @socket.close if @socket && !@socket.closed?
+      raise
     end
 
     def closed?

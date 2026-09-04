@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Split Code Mode into focused components while preserving the public API; fix `do...end` block results.
+- Add branch-focused interpreter tests, concurrent request tests, and local HTTP/TCP/WebSocket fault injection.
+- Isolate WebRTC peers between clients, close failed registrations, and align native offer/answer negotiation with `webrtc-ruby`.
+- Close WebSocket sockets when the opening handshake fails.
+- Add an opt-in real gRPC/WebRTC integration suite and raise coverage gates to 80% lines / 60% branches.
+- Bound native integration runs with a subprocess watchdog. Include an opt-in source patch for `webrtc-ruby` 1.0.0 shutdown deadlocks, pointer-lifetime protection, and real callback/concurrent-shutdown regression tests.
+
 - Isolate MCP sessions and resource mappings between clients and clean up failed registrations.
 - Follow MCP tool/resource pagination and raise `ToolCallError` for tool failures, preserving the original payload.
 - Enforce stdio deadlines across partial reads, notifications, and blocked writes; bound message and stderr buffers.

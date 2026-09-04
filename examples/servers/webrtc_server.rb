@@ -35,7 +35,7 @@ ExampleHTTP.server(port) do |server|
   server.mount_proc("/connect") do |request, response|
     payload = ExampleHTTP.request_json(request)
     candidates = []
-    peer = WebRTC::RTCPeerConnection.new
+    peer = WebRTC::RTCPeerConnection.new({ disable_auto_negotiation: true })
     peer.on_ice_candidate { |candidate| candidates << candidate if candidate }
     peer.on_data_channel do |channel|
       channel.on_message do |event|
@@ -50,11 +50,11 @@ ExampleHTTP.server(port) do |server|
     offer = WebRTC::RTCSessionDescription.new(type: :offer, sdp: payload.fetch("sdp"))
     peer.set_remote_description(offer).await
     answer = peer.create_answer.await
-    peer.set_local_description(answer).await
+    # The native binding already installs the answer while creating it.
     wait_for_ice(peer)
     peers_mutex.synchronize { peers[payload.fetch("peer_id")] = peer }
     ExampleHTTP.json(response, {
-      sdp: peer.local_description.sdp,
+      sdp: answer.sdp,
       candidates: candidates.map(&:to_h),
       tools: [{ name: "echo", description: "Echo over a WebRTC DataChannel" }]
     })

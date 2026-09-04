@@ -3,3 +3,4 @@
 /*.gem
 /vendor/bundle/
 .DS_Store
+/vendor/native/

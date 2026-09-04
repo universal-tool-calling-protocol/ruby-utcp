@@ -234,6 +234,27 @@ class MCPStdioTest < Minitest::Test
     end
   end
 
+  def test_parallel_requests_keep_response_ids_and_payloads_together
+    with_server(<<~RUBY) do |session|
+      while (line = $stdin.gets)
+        request = JSON.parse(line)
+        puts JSON.generate(jsonrpc: "2.0", id: request["id"], result: request["params"])
+      end
+    RUBY
+      gate = Queue.new
+      threads = 8.times.map do |index|
+        Thread.new { gate.pop; session.request("echo", "worker" => index) }
+      end
+      threads.length.times { gate << true }
+      threads.each_with_index do |thread, index|
+        assert thread.join(3), "MCP worker did not finish"
+        assert_equal({ "worker" => index }, thread.value)
+      end
+    ensure
+      threads&.each { |thread| thread.kill.join if thread.alive? }
+    end
+  end
+
   def test_partial_line_cannot_bypass_timeout
     with_server('$stdin.gets; print \'{"jsonrpc":"2.0"\'; sleep 5', timeout: 0.2) do |session|
       Timeout.timeout(3) do
