@@ -34,9 +34,9 @@ module UTCP
     private
 
     def assert_template!(template)
-      return if template.is_a?(FileCallTemplate)
+      raise ValidationError, "file protocol requires a FileCallTemplate" unless template.is_a?(FileCallTemplate)
 
-      raise ValidationError, "file protocol requires a FileCallTemplate"
+      assert_no_auth!(template)
     end
 
     def resolve_path(client, path)
@@ -49,4 +49,3 @@ module UTCP
   end
   FileCommunicationProtocol = FileProtocol
 end
-

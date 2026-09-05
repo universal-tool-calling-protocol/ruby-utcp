@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "base64"
+require "digest/sha2"
 require "ipaddr"
 require "json"
 require "net/http"
@@ -41,6 +42,7 @@ module UTCP
 
   class HTTPProtocol < CommunicationProtocol
     REDIRECTS = [301, 302, 303, 307, 308].freeze
+    SENSITIVE_HEADERS = %w[Authorization Proxy-Authorization Cookie].freeze
     REQUEST_CLASSES = {
       "GET" => Net::HTTP::Get,
       "POST" => Net::HTTP::Post,
@@ -183,6 +185,7 @@ module UTCP
       case auth
       when ApiKeyAuth
         assert_header_safe!(auth.var_name, "API key name")
+        assert_header_safe!(auth.api_key, "API key value") unless auth.location == "query"
         case auth.location
         when "header"
           headers[auth.var_name] = auth.api_key
@@ -207,7 +210,10 @@ module UTCP
 
     def oauth_token(auth)
       @oauth_mutex.synchronize do
-        cache_key = [auth.token_url, auth.client_id, auth.scope]
+        # Include the full credentials without retaining a plaintext secret in the cache key.
+        cache_key = Digest::SHA256.hexdigest(JSON.generate([
+          auth.token_url, auth.client_id, auth.client_secret, auth.scope
+        ]))
         cached = @oauth_tokens[cache_key]
         return cached[:token] if cached && cached[:expires_at] > Time.now.to_f + 5
 
@@ -222,7 +228,7 @@ module UTCP
           "POST", token_uri,
           headers: {}, cookies: {}, body: URI.encode_www_form(fields),
           content_type: "application/x-www-form-urlencoded", timeout: @open_timeout,
-          sensitive_headers: ["Authorization"]
+          sensitive_headers: ["Authorization"], allow_cross_origin_redirects: false
         )
         data = JSON.parse(response.body)
         token = data["access_token"]
@@ -239,7 +245,7 @@ module UTCP
     end
 
     def perform_request(method, uri, headers:, cookies:, body:, content_type:, timeout:,
-                        sensitive_headers:, redirects: 0)
+                        sensitive_headers:, redirects: 0, allow_cross_origin_redirects: true)
       URLSecurity.validate!(uri.to_s, context: "HTTP request")
       raise ToolCallError, "Too many HTTP redirects" if redirects > @max_redirects
 
@@ -271,7 +277,13 @@ module UTCP
         next_headers = headers.dup
         next_cookies = cookies.dup
         unless URLSecurity.same_origin?(uri, target)
-          sensitive_headers.each { |name| next_headers.delete_if { |key, _| key.casecmp?(name) } }
+          # Token requests carry credentials in the body, which header stripping cannot protect.
+          unless allow_cross_origin_redirects
+            raise SecurityError, "Cross-origin HTTP redirects are not allowed for this request"
+          end
+          (SENSITIVE_HEADERS + sensitive_headers).each do |name|
+            next_headers.delete_if { |key, _| key.casecmp?(name) }
+          end
           next_cookies = {}
         end
         next_method = response.code.to_i == 303 || ([301, 302].include?(response.code.to_i) && method.to_s.upcase == "POST") ? "GET" : method
@@ -279,7 +291,8 @@ module UTCP
         return perform_request(
           next_method, target, headers: next_headers, cookies: next_cookies,
           body: next_body, content_type: content_type, timeout: timeout,
-          sensitive_headers: sensitive_headers, redirects: redirects + 1
+          sensitive_headers: sensitive_headers, redirects: redirects + 1,
+          allow_cross_origin_redirects: allow_cross_origin_redirects
         )
       end
 

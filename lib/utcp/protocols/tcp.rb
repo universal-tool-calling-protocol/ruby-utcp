@@ -31,9 +31,9 @@ module UTCP
     private
 
     def assert_template!(template)
-      return if template.is_a?(TcpCallTemplate)
+      raise ValidationError, "TCP protocol requires a TcpCallTemplate" unless template.is_a?(TcpCallTemplate)
 
-      raise ValidationError, "TCP protocol requires a TcpCallTemplate"
+      assert_no_auth!(template)
     end
 
     def exchange(template, message)

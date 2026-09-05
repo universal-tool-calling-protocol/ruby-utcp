@@ -125,6 +125,29 @@ Complete runnable/configuration examples are in [examples/README.md](examples/RE
 
 Run `make` to start every available matching local server, execute its clients, and cleanly stop the servers. Missing optional gRPC/WebRTC backends are reported and skipped. `make full-demo` is the strict 12/12 target; `make standard-demo` always runs only the pairs that do not need native backends.
 
+### Authentication by transport
+
+| Transport | Supported `auth` | Authentication checks |
+| --- | --- | --- |
+| HTTP | API key in header/query/cookie, Basic, OAuth2 | Discovery and calls; strips credentials on cross-origin redirects |
+| SSE | API key in header/query/cookie, Basic, OAuth2 | Discovery and streaming; streaming redirects are rejected |
+| Streamable HTTP (`streamable_http`, alias `http_stream`) | API key in header/query/cookie, Basic, OAuth2 | Discovery and streaming; streaming redirects are rejected |
+| WebSocket | API key in header/query/cookie, Basic, OAuth2 | Handshake; connections are separated by client and effective credentials |
+| GraphQL | API key in header/query/cookie, Basic, OAuth2 | Introspection, queries/mutations and WebSocket subscriptions |
+| gRPC | API key with `location: "header"` mapped to metadata, Basic, OAuth2 | Discovery, unary calls and server streams |
+| MCP HTTP | API key in header/query/cookie, Basic, OAuth2 | Initialization, discovery and calls; sessions are separated by client, endpoint and credentials |
+| MCP stdio | No built-in `auth` support | Rejects `auth` before starting a process; configure the server's own credentials through its environment |
+| CLI | No built-in `auth` support | Rejects `auth`; the invoked command can use explicit `env_vars` |
+| TCP | No built-in `auth` support | Rejects `auth` before socket I/O; application message authentication is caller-defined |
+| UDP | No built-in `auth` support | Rejects `auth` before socket I/O; application message authentication is caller-defined |
+| WebRTC | No built-in `auth` support | Rejects `auth` before creating a peer; signaling authentication is not implemented |
+| Text | No transport `auth` | Rejects `auth`; `auth_tools` can configure tools converted from OpenAPI |
+| File | No transport `auth` | Rejects `auth` before reading a file; `auth_tools` can configure tools converted from OpenAPI |
+
+Unsupported auth configuration raises `AuthenticationError` on calls and makes manual registration fail. HTTP/WebSocket 401/403 and native gRPC UNAUTHENTICATED/PERMISSION_DENIED errors are reported as `AuthenticationError`. Invalid header/cookie API keys containing CR/LF are rejected before transport I/O. MCP session IDs are stripped on cross-origin redirects; changed auth or static server headers create a fresh, initialized session. Custom MCP session factories are responsible for their own authentication.
+
+The default suite tests the auth matrix at transport boundaries and uses local HTTP/WebSocket servers for wire-level checks. Native gRPC checks additionally run with `UTCP_NATIVE_TESTS=1 bundle exec rake native TESTOPTS='--name /NativeGRPCTest/'`; this subset does not require loading the WebRTC backend.
+
 ### HTTP, SSE, and Streamable HTTP
 
 HTTP templates support URL path parameters, query parameters, JSON or text bodies, input-to-header mapping, API keys, Basic auth, and OAuth2 client credentials.
@@ -146,6 +169,8 @@ HTTP templates support URL path parameters, query parameters, JSON or text bodie
 ```
 
 Remote HTTP endpoints must use HTTPS. Plain HTTP is accepted only for loopback hosts, which keeps local development convenient. Redirect targets are checked again and credentials are removed on cross-origin redirects.
+
+Cross-origin redirects remove explicit `Authorization`, `Proxy-Authorization`, and `Cookie` headers as well as headers supplied by the auth configuration. OAuth2 token requests follow redirects only within the same origin (scheme, host, and port), so client credentials cannot be forwarded to another origin. Cached OAuth2 tokens are keyed by the token URL, client ID, client secret, and scope; changing credentials requires a new token request.
 
 An HTTP, text, or file manual may also contain an OpenAPI 3 or Swagger 2 document. It is converted into UTCP tools automatically.
 

@@ -24,6 +24,12 @@ module UTCP
 
     private
 
+    def assert_no_auth!(template, context: template.call_template_type)
+      return unless template.auth
+
+      raise AuthenticationError, "#{context} does not support the auth field"
+    end
+
     def manual_from_payload(template, payload, source: "protocol response")
       data = if payload.is_a?(String)
                Utils.parse_document(payload, source: source)

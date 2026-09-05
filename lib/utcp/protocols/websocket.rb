@@ -140,6 +140,9 @@ module UTCP
       header_text = read_headers
       lines = header_text.split("\r\n")
       status = lines.shift.to_s.split[1].to_i
+      if status == 401 || status == 403
+        raise AuthenticationError, "WebSocket authentication failed with status #{status}"
+      end
       raise ToolCallError, "WebSocket handshake failed with status #{status}" unless status == 101
 
       response_headers = lines.each_with_object({}) do |line, result|

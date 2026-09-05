@@ -43,9 +43,9 @@ module UTCP
     private
 
     def assert_template!(template)
-      return if template.is_a?(CliCallTemplate)
+      raise ValidationError, "CLI protocol requires a CliCallTemplate" unless template.is_a?(CliCallTemplate)
 
-      raise ValidationError, "CLI protocol requires a CliCallTemplate"
+      assert_no_auth!(template)
     end
 
     def execute(client, template, arguments)
@@ -183,4 +183,3 @@ module UTCP
   end
   CliCommunicationProtocol = CLIProtocol
 end
-

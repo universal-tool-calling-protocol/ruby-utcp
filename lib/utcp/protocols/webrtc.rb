@@ -204,9 +204,9 @@ module UTCP
     private
 
     def assert_webrtc_template!(template)
-      return if template.is_a?(WebRtcCallTemplate)
+      raise ValidationError, "WebRTC protocol requires a WebRtcCallTemplate" unless template.is_a?(WebRtcCallTemplate)
 
-      raise ValidationError, "WebRTC protocol requires a WebRtcCallTemplate"
+      assert_no_auth!(template)
     end
 
     def peer_for(client, template)

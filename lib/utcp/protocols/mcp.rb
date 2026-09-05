@@ -232,7 +232,6 @@ module UTCP
       template.servers.each do |server_name, config|
         begin
           session = session_for(client, template, server_name, config)
-          initialize_session(session, template)
           each_list_item(session, "tools/list", "tools") do |tool|
             tools << Tool.new(
               name: "#{server_name}.#{tool.fetch("name")}",
@@ -296,6 +295,7 @@ module UTCP
       query = {}
       cookies = {}
       sensitive = apply_auth(template.auth, headers, query, cookies)
+      sensitive << "MCP-Session-Id"
       if template.auth.is_a?(OAuth2Auth)
         headers["Authorization"] = "Bearer #{oauth_token(template.auth)}"
         sensitive << "Authorization"
@@ -326,15 +326,32 @@ module UTCP
     end
 
     def session_for(client, template, server_name, config)
-      key = [client, template.name, server_name]
+      http_transport = %w[http streamable_http sse].include?(config["transport"].to_s) || config["url"]
+      assert_no_auth!(template, context: "MCP stdio") unless http_transport || @session_factory
+      # A session belongs to the credentials and endpoint used to initialize it.
+      fingerprint = Digest::SHA256.hexdigest(JSON.generate([
+        config, template.auth&.to_h, template.protocol_version, template.timeout
+      ]))
+      key = [client, template.name, server_name, fingerprint]
       @sessions_mutex.synchronize do
-        @sessions[key] ||= if @session_factory
-                            @session_factory.call(server_name, config, template)
-                          elsif %w[http streamable_http sse].include?(config["transport"].to_s) || config["url"]
-                            MCPHTTPSession.new(config, template, self)
-                          else
-                            MCPStdioSession.new(config, template.timeout)
-                          end
+        return @sessions[key] if @sessions.key?(key)
+
+        snapshot = McpCallTemplate.from_h(Utils.deep_copy(template.to_h))
+        server_config = snapshot.servers.fetch(server_name)
+        session = if @session_factory
+                    @session_factory.call(server_name, server_config, snapshot)
+                  elsif http_transport
+                    MCPHTTPSession.new(server_config, snapshot, self)
+                  else
+                    MCPStdioSession.new(server_config, snapshot.timeout)
+                  end
+        begin
+          initialize_session(session, snapshot)
+        rescue StandardError
+          session.close
+          raise
+        end
+        @sessions[key] = session
       end
     end
 

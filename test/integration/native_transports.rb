@@ -3,8 +3,6 @@
 # Deliberately outside *_test.rb: this suite requires real, loadable native gems.
 require_relative "../test_helper"
 require "grpc"
-gem "webrtc-ruby", "1.0.0"
-require "webrtc"
 require "webrick"
 require "timeout"
 
@@ -41,8 +39,12 @@ class NativeService
   def call_tool(request, call)
     args = JSON.parse(UTCP::ProtobufWire.fields(request.bytes)[2].first)
     raise GRPC::Unavailable, "simulated outage" if args["fail"]
+    raise GRPC::Unauthenticated, "invalid credentials" if args["auth_error"] == "unauthenticated"
+    raise GRPC::PermissionDenied, "access denied" if args["auth_error"] == "forbidden"
     sleep 0.2 if args["slow"]
-    NativeMessage.new(UTCP::ProtobufWire.string_field(1, JSON.generate(args.merge("authorization" => call.metadata["authorization"]))))
+    NativeMessage.new(UTCP::ProtobufWire.string_field(1, JSON.generate(args.merge(
+      "authorization" => call.metadata["authorization"], "api_key" => call.metadata["x-api-key"]
+    ))))
   end
 
   def call_tool_stream(request, call)
@@ -79,6 +81,38 @@ class NativeGRPCTest < Minitest::Test
     assert_equal 2, @client.call_tool_streaming("native.echo", message: "stream").to_a.length
   end
 
+  def test_real_api_key_metadata
+    template = UTCP::GrpcCallTemplate.new(
+      host: "127.0.0.1", port: @port, use_ssl: false,
+      auth: { auth_type: "api_key", api_key: "test-only-key" }
+    )
+    protocol = UTCP::GRPCProtocol.new
+    assert_equal "test-only-key", protocol.call_tool(nil, "echo", {}, template)["api_key"]
+    values = protocol.call_tool_streaming(nil, "echo", {}, template).to_a
+    assert_equal ["test-only-key", "test-only-key"], values.map { |value| value["api_key"] }
+  end
+
+  def test_real_oauth_token_metadata
+    protocol = UTCP::GRPCProtocol.new
+    protocol.define_singleton_method(:send_request) do |_uri, _request, _timeout|
+      FakeHTTPResponse.new(body: JSON.generate(access_token: "test-oauth-token", expires_in: 300))
+    end
+    template = UTCP::GrpcCallTemplate.new(
+      host: "127.0.0.1", port: @port, use_ssl: false,
+      auth: { auth_type: "oauth2", token_url: "https://identity.example.test/token", client_id: "test", client_secret: "test" }
+    )
+    assert_equal "Bearer test-oauth-token", protocol.call_tool(nil, "echo", {}, template)["authorization"]
+    values = protocol.call_tool_streaming(nil, "echo", {}, template).to_a
+    assert_equal ["Bearer test-oauth-token"] * 2, values.map { |value| value["authorization"] }
+  end
+
+  def test_real_authentication_failures_for_unary_and_streaming
+    %w[unauthenticated forbidden].each do |status|
+      assert_raises(UTCP::AuthenticationError) { @client.call_tool("native.echo", auth_error: status) }
+      assert_raises(UTCP::AuthenticationError) { @client.call_tool_streaming("native.echo", auth_error: status).to_a }
+    end
+  end
+
   def test_real_parallel_calls_do_not_mix_results
     workers = 6.times.map { |index| Thread.new { @client.call_tool("native.echo", index: index) } }
     workers.each_with_index do |worker, index|
@@ -100,6 +134,8 @@ end
 
 class NativeWebRTCTest < Minitest::Test
   def setup
+    gem "webrtc-ruby", "1.0.0"
+    require "webrtc"
     WebRTC.init
     @peers = []
     @peers_by_id = {}

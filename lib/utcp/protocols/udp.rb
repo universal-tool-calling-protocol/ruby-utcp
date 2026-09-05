@@ -30,9 +30,9 @@ module UTCP
     private
 
     def assert_template!(template)
-      return if template.is_a?(UdpCallTemplate)
+      raise ValidationError, "UDP protocol requires a UdpCallTemplate" unless template.is_a?(UdpCallTemplate)
 
-      raise ValidationError, "UDP protocol requires a UdpCallTemplate"
+      assert_no_auth!(template)
     end
 
     def exchange(template, message, response_count:)

@@ -85,15 +85,21 @@ module UTCP
         deadline: Time.now + timeout,
         metadata: metadata
       )
+    rescue GRPC::Unauthenticated, GRPC::PermissionDenied => error
+      raise AuthenticationError, "gRPC authentication failed: #{error.details}"
     end
 
     def server_stream(route, payload, timeout:, metadata: {})
+      return enum_for(__method__, route, payload, timeout: timeout, metadata: metadata) unless block_given?
+
       @stub.server_streamer(
         route, payload,
         ->(value) { value.to_s.b }, ->(bytes) { bytes },
         deadline: Time.now + timeout,
         metadata: metadata
-      )
+      ).each { |response| yield response }
+    rescue GRPC::Unauthenticated, GRPC::PermissionDenied => error
+      raise AuthenticationError, "gRPC authentication failed: #{error.details}"
     end
   end
 
@@ -165,9 +171,20 @@ module UTCP
     private
 
     def assert_grpc_template!(template)
-      return if template.is_a?(GrpcCallTemplate)
+      raise ValidationError, "gRPC protocol requires a GrpcCallTemplate" unless template.is_a?(GrpcCallTemplate)
 
-      raise ValidationError, "gRPC protocol requires a GrpcCallTemplate"
+      case template.auth
+      when nil, BasicAuth, OAuth2Auth
+        nil
+      when ApiKeyAuth
+        unless template.auth.location == "header"
+          raise AuthenticationError, "gRPC API keys require location=header (request metadata)"
+        end
+        assert_header_safe!(template.auth.var_name, "API key name")
+        assert_header_safe!(template.auth.api_key, "API key value")
+      else
+        raise AuthenticationError, "Unsupported gRPC authentication type: #{template.auth.auth_type}"
+      end
     end
 
     def rpc_client(template)

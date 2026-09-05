@@ -30,9 +30,9 @@ module UTCP
     private
 
     def assert_template!(template)
-      return if template.is_a?(TextCallTemplate)
+      raise ValidationError, "text protocol requires a TextCallTemplate" unless template.is_a?(TextCallTemplate)
 
-      raise ValidationError, "text protocol requires a TextCallTemplate"
+      assert_no_auth!(template)
     end
 
     def openapi?(data)
@@ -41,4 +41,3 @@ module UTCP
   end
   TextCommunicationProtocol = TextProtocol
 end
-
