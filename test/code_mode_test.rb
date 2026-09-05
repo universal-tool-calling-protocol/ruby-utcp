@@ -150,7 +150,7 @@ class CodeModeTest < Minitest::Test
 
   def test_rejects_oversized_integer_powers_even_when_result_is_discarded
     %w[2 -2].each do |base|
-      [10_000_000, -10_000_000].each do |exponent|
+      [UTCP::CodeMode::MAX_INTEGER_BITS, -UTCP::CodeMode::MAX_INTEGER_BITS].each do |exponent|
         error = assert_raises(UTCP::CodeModeLimitError) do
           @client.call_tool_chain("(#{base}) ** #{exponent}; 0", max_steps: 100)
         end

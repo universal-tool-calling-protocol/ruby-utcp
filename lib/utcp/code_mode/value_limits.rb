@@ -81,11 +81,21 @@ module UTCP
           value.map { |item| safe_tool_value(item, depth + 1, budget) }
         when Hash
           value.each_with_object({}) do |(key, item), result|
-            safe_key = key.is_a?(Symbol) ? key : key.to_s
+            key_string = safe_tool_value(key.to_s, depth + 1, budget)
+            safe_key = key.is_a?(Symbol) ? key : key_string
             result[safe_key] = safe_tool_value(item, depth + 1, budget)
           end
         else
           raise CodeModeExecutionError, "Tool returned unsupported #{value.class} value"
+        end
+      end
+
+      def safe_tool_stream(stream)
+        # Reserve the root array so streamed and ordinary results use the same budget.
+        budget = { items: MAX_VALUE_ITEMS - 1, bytes: MAX_VALUE_BYTES }
+        stream.each_with_object([]) do |item, result|
+          tick!
+          result << safe_tool_value(item, 1, budget)
         end
       end
     end

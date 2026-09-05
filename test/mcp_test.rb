@@ -105,6 +105,55 @@ class MCPTest < Minitest::Test
     assert_includes session.calls, ["resources/list", { "cursor" => "next" }]
   end
 
+  def test_variable_inspection_closes_only_its_own_sessions
+    sessions = []
+    UTCP.register_protocol("mcp", UTCP::MCPProtocol.new(session_factory: ->(_name, config, _template) {
+      Session.new(config.fetch("command")).tap { |session| sessions << session }
+    }))
+    registered = client(resources: true)
+    template = registered.config.manual_call_templates.first
+
+    2.times do
+      assert_empty registered.get_required_variables_for_manual_and_tools(template)
+      assert sessions.last.closed
+      refute sessions.first.closed
+      assert_equal "server-a", registered.call_tool("bridge.local.echo")
+      assert_equal "docs://server-a", registered.call_tool("bridge.local.resource_docs")["contents"].first["uri"]
+      assert_equal 1, registered.manuals.length
+    end
+    assert_equal 3, sessions.length
+  end
+
+  def test_variable_inspection_without_registration_closes_its_session
+    session = Session.new("inspection")
+    use_session(session)
+    inspector = UTCP::Client.new
+    template = UTCP::McpCallTemplate.new(name: "probe", config: { mcpServers: { local: { command: "unused" } } })
+
+    assert_empty inspector.get_required_variables_for_manual_and_tools(template)
+    assert session.closed
+    assert_empty inspector.manuals
+    assert_empty inspector.list_tools
+  end
+
+  def test_failed_variable_inspection_does_not_close_a_registered_session
+    sessions = []
+    UTCP.register_protocol("mcp", UTCP::MCPProtocol.new(session_factory: ->(_name, config, _template) {
+      session = if sessions.empty?
+                  Session.new(config.fetch("command"))
+                else
+                  Session.new("failed") { |_method, _params| raise "discovery failed" }
+                end
+      sessions << session
+      session
+    }))
+    registered = client
+    assert_empty registered.get_required_variables_for_manual_and_tools(registered.config.manual_call_templates.first)
+    assert sessions.last.closed
+    refute sessions.first.closed
+    assert_equal "server-a", registered.call_tool("bridge.local.echo")
+  end
+
   def test_repeated_pagination_cursor_fails_registration_and_closes_session
     session = Session.new("loop") do |method, _params|
       method == "tools/list" ? { "tools" => [], "nextCursor" => "again" } : {}

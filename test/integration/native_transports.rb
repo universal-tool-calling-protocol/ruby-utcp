@@ -194,6 +194,12 @@ class NativeWebRTCTest < Minitest::Test
     assert_raises(UTCP::TimeoutError) { client.call_tool("native.echo", no_response: true) }
     assert_equal({ "message" => "after timeout" }, client.call_tool("native.echo", message: "after timeout"))
   end
+end
+
+# Extra backend regression probes require shutdown guarantees absent from the
+# stock webrtc-ruby 1.0.0 release. Keep them available without requiring a patch
+# for the transport integration suite or modifying the installed dependency.
+module NativeWebRTCShutdownRegressions
 
   def test_channel_destroy_allows_an_active_native_callback_to_finish
     assert_channel_shutdown_progress(:destroy)
@@ -344,3 +350,5 @@ class NativeWebRTCTest < Minitest::Test
     release << true
   end
 end
+
+NativeWebRTCTest.include(NativeWebRTCShutdownRegressions) if ENV["UTCP_WEBRTC_SHUTDOWN_REGRESSIONS"] == "1"

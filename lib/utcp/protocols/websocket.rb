@@ -250,33 +250,35 @@ module UTCP
 
     def register_manual(client, template)
       assert_websocket_template!(template)
-      entry, transient = connection_for(template, {})
+      entry, transient = connection_for(client, template, {})
       payload = entry.mutex.synchronize do
         entry.connection.send_text(JSON.generate("type" => "utcp"))
         _opcode, bytes = entry.connection.read_message
         bytes
       end
-      entry.connection.close if transient
       success(template, manual_from_payload(template, payload, source: "WebSocket discovery response"))
     rescue StandardError => error
       client.logger.warn("Unable to register WebSocket manual #{template.name.inspect}: #{error.message}")
       failure(template, error)
+    ensure
+      entry.connection.close if entry && transient
     end
 
-    def deregister_manual(_client, template)
-      prefix = [template.url, template.protocol].join("\0") + "\0"
+    def deregister_manual(client, template)
       entries = @connections_mutex.synchronize do
-        keys = @connections.keys.select { |key| key.start_with?(prefix) }
+        keys = @connections.keys.select do |owner, url, subprotocol, _key|
+          owner.equal?(client) && url == template.url && subprotocol == template.protocol
+        end
         keys.map { |key| @connections.delete(key) }
       end
       entries.each { |entry| entry.connection.close }
       nil
     end
 
-    def call_tool(_client, tool_name, tool_args, template)
+    def call_tool(client, tool_name, tool_args, template)
       assert_websocket_template!(template)
       args = Utils.stringify_keys(tool_args || {})
-      entry, transient, message_args = connection_for(template, args, include_arguments: true)
+      entry, transient, message_args = connection_for(client, template, args, include_arguments: true)
       result = entry.mutex.synchronize do
         message = format_message(template, message_args)
         entry.connection.send_text(message)
@@ -302,7 +304,7 @@ module UTCP
       raise ValidationError, "WebSocket protocol requires a WebSocketCallTemplate"
     end
 
-    def connection_for(template, arguments, include_arguments: false)
+    def connection_for(client, template, arguments, include_arguments: false)
       args = arguments.dup
       headers = Utils.stringify_keys(template.headers || {})
       template.header_fields.each { |field| headers[field] = args.delete(field).to_s if args.key?(field) }
@@ -315,7 +317,7 @@ module UTCP
       headers["Cookie"] = cookies.map { |key, value| "#{key}=#{value}" }.join("; ") unless cookies.empty?
       url = append_query(template.url, query)
       WebSocketURLSecurity.validate!(url)
-      key = connection_key(template, url, headers)
+      key = [client, template.url, template.protocol, connection_key(template, url, headers)]
       if template.keep_alive
         entry = @connections_mutex.synchronize do
           current = @connections[key]

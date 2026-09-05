@@ -14,7 +14,7 @@ module UTCP
           safe_tool_value(@client.call_tool(arguments[0], tool_arguments(arguments[1])))
         when "call_tool_stream", "call_tool_streaming"
           require_arity!("codemode.#{method_name}", arguments, 1..2)
-          safe_tool_value(@client.call_tool_streaming(arguments[0], tool_arguments(arguments[1])).to_a)
+          safe_tool_stream(@client.call_tool_streaming(arguments[0], tool_arguments(arguments[1])))
         when "search_tools"
           require_arity!("codemode.search_tools", arguments, 1..2)
           options = arguments[1].is_a?(Hash) ? arguments[1] : {}

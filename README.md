@@ -267,7 +267,7 @@ load_variables_from:
     env_file_path: .env
 ```
 
-Manual-specific names are tried first. For a manual named `weather_api`, `${TOKEN}` first looks for `weather__api_TOKEN`, then `TOKEN`. Use `get_required_variables_for_manual_and_tools` or `get_required_variables_for_registered_tool` to inspect requirements without exposing values.
+Manual-specific names are tried first. For a manual named `weather_api`, `${TOKEN}` first looks for `weather__api_TOKEN`, then `TOKEN`. Use `get_required_variables_for_manual_and_tools` or `get_required_variables_for_registered_tool` to inspect requirements without exposing values. Discovery performed by the former uses a temporary client and closes its sessions before returning, including on failure; existing client sessions stay open.
 
 ## Migrating v0.1 documents
 
@@ -315,7 +315,7 @@ Use `codemode.call_tool_stream` to collect a streaming call into an array. `code
 
 Code Mode accepts a constrained Ruby subset for local variables, JSON-like literals, arithmetic, conditionals, loops, indexing, and common collection transforms. It is interpreted without `eval`; filesystem, process, constant, reflection, import, and direct network APIs are not exposed. Executions also have code-size, step, result-size, log-size, and wall-clock limits. External effects remain possible through the UTCP tools that you deliberately register.
 
-The 1 MiB value budget includes numeric payloads as well as strings. Integer powers and products are checked before allocating their results, and non-finite floating-point results are rejected. Power checks use a conservative size estimate and can reject expressions close to the limit.
+The 30 MiB (31,457,280 bytes) value budget is shared across strings, numeric payloads, and hash keys within each tool argument, result, or collected stream. String and symbol keys count toward both the byte budget and the 10,000-value limit. Streams are checked one item at a time and stop as soon as the shared budget is exceeded. Integer powers and products are checked before allocating their results, and non-finite floating-point results are rejected. Power checks use a conservative size estimate and can reject expressions close to the limit. Source code is limited to 64 KiB and captured logs to 1 MiB per execution.
 
 ## Custom protocol plugins
 
@@ -361,4 +361,8 @@ bundle exec make standard-demo
 gem build ruby-utcp.gemspec
 ```
 
-CI runs the tests and gem build on Ruby 2.6, 2.7, 3.0–3.4, and 4.0. A separate Ruby 3.4 job runs the local transport examples and enforces minimum coverage of 75% of executable lines and 45% of branches. The standard demo uses WEBrick, included as a development dependency; native gRPC/WebRTC backends remain optional.
+CI runs the tests and gem build on Ruby 2.6, 2.7, 3.0–3.4, and 4.0. A separate Ruby 3.4 job runs the local transport examples and enforces minimum coverage of 80% of executable lines and 60% of branches. The standard demo uses WEBrick, included as a development dependency.
+
+A dedicated Ruby 3.4 CI job sets `UTCP_NATIVE_TESTS=1` to install the original, unmodified backends from the Gemfile, builds libdatachannel 0.24.5 and the WebRTC extension, and runs `bundle exec rake native`. The test subprocess has a 45-second watchdog. The native dependencies remain optional for applications using the gem.
+
+The default native suite checks discovery, real calls, streaming, concurrent requests, timeouts, and client isolation. Additional backend shutdown probes are opt-in with `UTCP_WEBRTC_SHUTDOWN_REGRESSIONS=1`; they require callback shutdown guarantees that the stock `webrtc-ruby` 1.0.0 release does not provide and are not part of the CI job. No WebRTC patches are installed or applied.

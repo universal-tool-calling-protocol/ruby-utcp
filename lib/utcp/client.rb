@@ -132,12 +132,22 @@ module UTCP
       return required unless required.empty?
 
       substituted = substitute_template(template, template.name)
-      result = fetch_protocol(substituted.call_template_type).register_manual(self, substituted)
-      return [] unless result.success?
+      protocol = fetch_protocol(substituted.call_template_type)
+      # Give discovery its own session owner and repository, even for an existing manual.
+      inspection_config = config.dup
+      inspection_config.tool_repository = InMemoryToolRepository.new
+      inspection_config.manual_call_templates = []
+      inspection_client = Client.new(root_dir: root_dir, config: inspection_config, logger: logger)
+      begin
+        result = protocol.register_manual(inspection_client, substituted)
+        return [] unless result.success?
 
-      result.manual.tools.flat_map do |tool|
-        variable_substitutor.find_required_variables(tool.tool_call_template.to_h, template.name)
-      end.uniq
+        result.manual.tools.flat_map do |tool|
+          variable_substitutor.find_required_variables(tool.tool_call_template.to_h, template.name)
+        end.uniq
+      ensure
+        protocol.deregister_manual(inspection_client, substituted)
+      end
     end
 
     def get_required_variables_for_registered_tool(tool_name)
@@ -214,4 +224,3 @@ module UTCP
   end
   UtcpClient = Client
 end
-

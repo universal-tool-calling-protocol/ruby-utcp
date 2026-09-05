@@ -19,8 +19,10 @@ end
 desc "Test real gRPC and WebRTC backends (requires optional native gems)"
 task :native do
   require "timeout"
+  require "shellwords"
   # A native deadlock can hold Ruby's GVL, so the watchdog must live in the parent.
-  pid = Process.spawn(RbConfig.ruby, "-Itest", "test/integration/native_transports.rb")
+  pid = Process.spawn(RbConfig.ruby, "-Itest", "test/integration/native_transports.rb",
+                      *Shellwords.split(ENV.fetch("TESTOPTS", "")))
   begin
     _pid, status = Timeout.timeout(45) { Process.wait2(pid) }
     abort "Native integration tests failed" unless status.success?

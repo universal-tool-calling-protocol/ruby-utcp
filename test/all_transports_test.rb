@@ -86,6 +86,30 @@ class AllTransportsTest < Minitest::Test
     assert_equal 80, connection.send(:websocket_port)
   end
 
+  def test_websocket_variable_inspection_does_not_close_the_active_connection
+    connections = []
+    protocol = UTCP::WebSocketProtocol.new(connection_factory: ->(*_args) {
+      FakeWebSocketConnection.new([
+        JSON.generate(tools: [{ name: "echo" }]), JSON.generate("echo" => "still connected")
+      ]).tap { |connection| connections << connection }
+    })
+    with_protocol("websocket", protocol) do
+      template = { name: "realtime", call_template_type: "websocket", url: "ws://localhost/socket",
+                   auth: { auth_type: "api_key", api_key: "test-only", location: "query", var_name: "token" } }
+      client = UTCP::Client.create(config: { manual_call_templates: [template] })
+      begin
+        assert_empty client.get_required_variables_for_manual_and_tools(template)
+        assert_equal 2, connections.length
+        assert connections.last.closed?
+        refute connections.first.closed?
+        assert_equal({ "echo" => "still connected" }, client.call_tool("realtime.echo"))
+      ensure
+        client.close
+      end
+      assert connections.all?(&:closed?)
+    end
+  end
+
   def test_graphql_introspection_creates_tools_and_query_call_returns_field
     protocol = Class.new(UTCP::GraphQLProtocol) do
       attr_reader :payloads

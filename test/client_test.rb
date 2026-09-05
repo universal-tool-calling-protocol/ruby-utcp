@@ -173,6 +173,53 @@ class ClientTest < Minitest::Test
                  client.get_required_variables_for_registered_tool("api.lookup").sort
   end
 
+  def test_variable_inspection_preserves_context_and_returns_tool_requirements
+    UTCP.register_call_template("inspection_test", MemoryTemplate)
+    registered_owner = nil
+    closed_owner = nil
+    protocol = MemoryProtocol.new
+    protocol.define_singleton_method(:register_manual) do |owner, template|
+      registered_owner = owner
+      UTCP::RegisterManualResult.new(
+        manual_call_template: template,
+        manual: UTCP::Manual.new(tools: [UTCP::Tool.new(
+          name: "lookup", tool_call_template: { call_template_type: "http", url: "https://example.com/${TOKEN}" }
+        )]),
+        success: true
+      )
+    end
+    protocol.define_singleton_method(:deregister_manual) { |owner, _template| closed_owner = owner }
+    UTCP.register_protocol("inspection_test", protocol)
+    client = UTCP::Client.new(root_dir: Dir.tmpdir, config: { variables: { BASE: "example.com" } })
+    template = { name: "probe", call_template_type: "inspection_test", manual_data: {} }
+
+    assert_equal ["probe_TOKEN"], client.get_required_variables_for_manual_and_tools(template)
+    refute_same client, registered_owner
+    assert_same registered_owner, closed_owner
+    assert_equal client.root_dir, registered_owner.root_dir
+    assert_equal client.config.variables, registered_owner.config.variables
+    refute_same client.config.tool_repository, registered_owner.config.tool_repository
+    assert_empty client.manuals
+  end
+
+  def test_variable_inspection_closes_resources_when_a_protocol_raises
+    UTCP.register_call_template("inspection_test", MemoryTemplate)
+    opened = []
+    protocol = MemoryProtocol.new
+    protocol.define_singleton_method(:register_manual) do |owner, _template|
+      opened << owner
+      raise "registration interrupted"
+    end
+    protocol.define_singleton_method(:deregister_manual) { |owner, _template| opened.delete(owner) }
+    UTCP.register_protocol("inspection_test", protocol)
+    client = UTCP::Client.new
+    template = { name: "probe", call_template_type: "inspection_test", manual_data: {} }
+
+    error = assert_raises(RuntimeError) { client.get_required_variables_for_manual_and_tools(template) }
+    assert_equal "registration interrupted", error.message
+    assert_empty opened
+  end
+
   def test_streaming_returns_an_enumerator
     content = text_manual([
       { name: "one", tool_call_template: { call_template_type: "text", content: "chunk" } }

@@ -134,7 +134,9 @@ class CodeModeBehaviorTest < Minitest::Test
       assert_raises(UTCP::CodeModeLimitError) { result('1', max_steps: value) }
     end
     assert_raises(UTCP::CodeModeLimitError) { result(' ' * (UTCP::CodeMode::MAX_CODE_BYTES + 1)) }
-    ['"x" * 1048577', '[1] * 10001', '(1..10001).to_a', 'a = "x" * 600000; a + a', 'a = [1] * 6000; a + a', '["x" * 600000, "y" * 600000].join', 'puts "x" * 600000; puts "y" * 600000'].each do |source|
+    oversized = UTCP::CodeMode::MAX_VALUE_BYTES + 1
+    half = UTCP::CodeMode::MAX_VALUE_BYTES / 2 + 1
+    ["\"x\" * #{oversized}", '[1] * 10001', '(1..10001).to_a', "a = \"x\" * #{half}; a + a", 'a = [1] * 6000; a + a', "[\"x\" * #{half}, \"y\" * #{half}].join", 'puts "x" * 600000; puts "y" * 600000'].each do |source|
       assert_raises(UTCP::CodeModeLimitError, source) { result(source) }
     end
   end
