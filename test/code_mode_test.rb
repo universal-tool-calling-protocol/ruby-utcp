@@ -165,8 +165,11 @@ class CodeModeTest < Minitest::Test
   end
 
   def test_rejects_oversized_integer_products
+    # Older Rubies turn very large powers into Infinity before multiplication.
+    value = 1 << (UTCP::CodeMode::MAX_INTEGER_BITS / 2)
+    @client.define_singleton_method(:call_tool) { |_name, _arguments| value }
     error = assert_raises(UTCP::CodeModeLimitError) do
-      @client.call_tool_chain("value = 2 ** #{UTCP::CodeMode::MAX_INTEGER_BITS / 2}; value * value; 0")
+      @client.call_tool_chain('value = codemode.call_tool("calc.add"); value * value; 0')
     end
     assert_match(/Integer product/, error.message)
   end
