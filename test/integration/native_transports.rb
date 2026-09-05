@@ -104,6 +104,7 @@ class NativeWebRTCTest < Minitest::Test
     @peers = []
     @peers_by_id = {}
     @channels = []
+    @channel_closures = {}
     @clients = []
     @server = WEBrick::HTTPServer.new(BindAddress: "127.0.0.1", Port: 0, AccessLog: [],
                                     Logger: WEBrick::Log.new(File::NULL, WEBrick::Log::FATAL))
@@ -125,7 +126,19 @@ class NativeWebRTCTest < Minitest::Test
     @clients.each(&:close)
     @server&.shutdown
     @worker.kill if @worker && !@worker.join(3)
-    @channels.each { |channel| channel.close; channel.destroy }
+    @channels.each do |channel|
+      channel.close
+      if (closed = @channel_closures[channel])
+        # A remote close sets ready_state before its Ruby callback finishes.
+        # Stock webrtc-ruby holds the GVL during destroy, so let that callback
+        # return before native destruction waits for its callback lock.
+        callback_thread = Timeout.timeout(3) { closed.pop }
+        unless callback_thread == Thread.current
+          assert callback_thread.join(3), "WebRTC channel close callback did not finish"
+        end
+      end
+      channel.destroy
+    end
     @peers.each(&:close)
   end
 
@@ -137,6 +150,8 @@ class NativeWebRTCTest < Minitest::Test
     candidates = []
     peer.on_ice_candidate { |candidate| candidates << candidate if candidate }
     peer.on_data_channel do |channel|
+      closed = @channel_closures[channel] = Queue.new
+      channel.on_close { closed << Thread.current }
       @channels << channel
       channel.on_message do |message|
         envelope = JSON.parse(message.data)
