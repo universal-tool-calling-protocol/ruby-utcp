@@ -42,9 +42,11 @@ module UTCP
       return nil if response_count.zero?
 
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + socket_timeout_seconds(template)
+      budget = ResponseByteBudget.new(template.max_response_bytes, "UDP")
       values = response_count.times.map do
         wait_readable!(socket, deadline, "UDP read")
         payload = socket.recv(65_535)
+        budget.consume(payload)
         decode_socket_payload(payload, template.response_byte_format)
       end
       values.length == 1 ? values.first : values

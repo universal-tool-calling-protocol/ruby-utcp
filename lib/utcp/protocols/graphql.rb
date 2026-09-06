@@ -93,7 +93,7 @@ module UTCP
         body: payload,
         content_type: "application/json",
         timeout: template.timeout,
-        sensitive_headers: sensitive.uniq
+        sensitive_headers: sensitive.uniq, max_response_bytes: template.max_response_bytes
       )
       data = JSON.parse(response.body)
       raise_graphql_errors!(data, template.operation_name || template.name)
@@ -243,9 +243,12 @@ module UTCP
       ws_scheme = http_uri.scheme == "https" ? "wss" : "ws"
       ws_url = http_uri.to_s.sub(/\Ahttps?/, ws_scheme)
       connection = @websocket_factory.call(ws_url, headers, "graphql-transport-ws", template.timeout)
+      connection.max_response_bytes = template.max_response_bytes if connection.respond_to?(:max_response_bytes=)
+      budget = ResponseByteBudget.new(template.max_response_bytes, "GraphQL subscription")
       identifier = SecureRandom.uuid
       connection.send_text(JSON.generate("type" => "connection_init", "payload" => {}))
       ack = connection.read_message
+      budget.consume(ack[1]) if ack
       ack_data = ack && decode_json_or_text(ack[1].force_encoding(Encoding::UTF_8))
       unless ack_data.is_a?(Hash) && ack_data["type"] == "connection_ack"
         raise ToolCallError, "GraphQL subscription did not receive connection_ack"
@@ -255,7 +258,11 @@ module UTCP
         "type" => "subscribe",
         "payload" => graphql_payload(tool_name, args, template)
       ))
-      while (frame = connection.read_message)
+      loop do
+        connection.max_response_bytes = budget.remaining if connection.respond_to?(:max_response_bytes=)
+        frame = connection.read_message
+        break unless frame
+        budget.consume(frame[1])
         message = decode_json_or_text(frame[1].force_encoding(Encoding::UTF_8))
         next unless message.is_a?(Hash) && message["id"] == identifier
         break if message["type"] == "complete"

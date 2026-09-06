@@ -136,7 +136,8 @@ module UTCP
         body: body,
         content_type: template.content_type,
         timeout: timeout,
-        sensitive_headers: sensitive_headers.uniq
+        sensitive_headers: sensitive_headers.uniq, max_response_bytes: template.max_response_bytes,
+        deadline: response_deadline(template.total_timeout || timeout)
       )
     end
 
@@ -245,7 +246,9 @@ module UTCP
     end
 
     def perform_request(method, uri, headers:, cookies:, body:, content_type:, timeout:,
-                        sensitive_headers:, redirects: 0, allow_cross_origin_redirects: true)
+                        sensitive_headers:, redirects: 0, allow_cross_origin_redirects: true,
+                        max_response_bytes: ResponseLimits::DEFAULT_MAX_RESPONSE_BYTES, deadline: nil)
+      deadline ||= response_deadline(timeout)
       URLSecurity.validate!(uri.to_s, context: "HTTP request")
       raise ToolCallError, "Too many HTTP redirects" if redirects > @max_redirects
 
@@ -270,7 +273,15 @@ module UTCP
         request.body = content_type.to_s.include?("json") && !body.is_a?(String) ? JSON.generate(body) : body.to_s
       end
 
-      response = send_request(uri, request, timeout)
+      response = with_response_timeout(deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)) do
+        send_request(uri, request, timeout) do |incoming|
+          incoming.body = LimitedHTTPResponse.new(incoming, max_response_bytes).body
+        end
+      end
+      # Custom adapters may return a buffered response without yielding it.
+      if response.body.to_s.bytesize > max_response_bytes
+        raise ToolCallError, "HTTP response exceeds max_response_bytes (#{max_response_bytes})"
+      end
       if REDIRECTS.include?(response.code.to_i) && response["location"]
         target = URI.join(uri.to_s, response["location"])
         URLSecurity.validate!(target.to_s, context: "HTTP redirect")
@@ -292,7 +303,8 @@ module UTCP
           next_method, target, headers: next_headers, cookies: next_cookies,
           body: next_body, content_type: content_type, timeout: timeout,
           sensitive_headers: sensitive_headers, redirects: redirects + 1,
-          allow_cross_origin_redirects: allow_cross_origin_redirects
+          allow_cross_origin_redirects: allow_cross_origin_redirects,
+          max_response_bytes: max_response_bytes, deadline: deadline
         )
       end
 
@@ -320,7 +332,27 @@ module UTCP
       http.verify_mode = OpenSSL::SSL::VERIFY_PEER if http.use_ssl?
       http.open_timeout = [Float(timeout), @open_timeout].min
       http.read_timeout = Float(timeout)
-      http.start { |connection| connection.request(request) }
+      http.write_timeout = Float(timeout) if http.respond_to?(:write_timeout=)
+      http.start do |connection|
+        connection.request(request) do |response|
+          if block_given?
+            yield response
+          else
+            response.body = LimitedHTTPResponse.new(response, ResponseLimits::DEFAULT_MAX_RESPONSE_BYTES).body
+          end
+        end
+      end
+    end
+
+    def response_deadline(seconds)
+      Process.clock_gettime(Process::CLOCK_MONOTONIC) + Float(seconds)
+    end
+
+    def with_response_timeout(seconds)
+      return yield if seconds.nil?
+      raise TimeoutError, "HTTP total response timeout exceeded" unless seconds.positive?
+
+      Timeout.timeout(seconds, TimeoutError, "HTTP total response timeout exceeded") { yield }
     end
 
     def parse_document(body, content_type, url)

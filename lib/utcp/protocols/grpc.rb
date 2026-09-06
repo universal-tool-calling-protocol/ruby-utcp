@@ -72,7 +72,8 @@ module UTCP
       require "grpc"
       address = "#{template.host}:#{template.port}"
       credentials = template.use_ssl ? GRPC::Core::ChannelCredentials.new : :this_channel_is_insecure
-      @stub = GRPC::ClientStub.new(address, credentials)
+      @stub = GRPC::ClientStub.new(address, credentials,
+                                   channel_args: { "grpc.max_receive_message_length" => template.max_response_bytes })
     rescue LoadError => error
       raise MissingDependencyError,
             "gRPC requires the optional 'grpc' gem (add gem \"grpc\" to your Gemfile): #{error.message}"
@@ -92,14 +93,18 @@ module UTCP
     def server_stream(route, payload, timeout:, metadata: {})
       return enum_for(__method__, route, payload, timeout: timeout, metadata: metadata) unless block_given?
 
-      @stub.server_streamer(
+      operation = @stub.server_streamer(
         route, payload,
         ->(value) { value.to_s.b }, ->(bytes) { bytes },
         deadline: Time.now + timeout,
-        metadata: metadata
-      ).each { |response| yield response }
+        metadata: metadata, return_op: true
+      )
+      operation.execute.each { |response| yield response }
+      complete = true
     rescue GRPC::Unauthenticated, GRPC::PermissionDenied => error
       raise AuthenticationError, "gRPC authentication failed: #{error.details}"
+    ensure
+      operation.cancel if operation && !complete
     end
   end
 
@@ -116,6 +121,7 @@ module UTCP
         timeout: template.timeout,
         metadata: grpc_metadata(template)
       )
+      ResponseByteBudget.new(template.max_response_bytes, "gRPC").consume(response)
       fields = ProtobufWire.fields(response)
       tools = fields[2].map do |tool_bytes|
         tool_fields = ProtobufWire.fields(tool_bytes)
@@ -144,6 +150,7 @@ module UTCP
         timeout: template.timeout,
         metadata: grpc_metadata(template)
       )
+      ResponseByteBudget.new(template.max_response_bytes, "gRPC").consume(response)
       decode_tool_response(response)
     rescue Error
       raise
@@ -156,12 +163,16 @@ module UTCP
 
       assert_grpc_template!(template)
       method = template.method_name || "CallToolStream"
+      budget = ResponseByteBudget.new(template.max_response_bytes, "gRPC stream")
       rpc_client(template).server_stream(
         route(template, method),
         tool_call_request(tool_name, tool_args),
         timeout: template.timeout,
         metadata: grpc_metadata(template)
-      ).each { |response| yield decode_tool_response(response) }
+      ).each do |response|
+        budget.consume(response)
+        yield decode_tool_response(response)
+      end
     rescue Error
       raise
     rescue StandardError => error

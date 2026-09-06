@@ -71,6 +71,7 @@ module UTCP
 
     def read_framed(socket, template, timeout)
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+      maximum = [template.max_response_size, template.max_response_bytes].min
       case template.framing_strategy
       when "length_prefix"
         prefix = read_exact(socket, template.length_prefix_bytes, deadline)
@@ -81,16 +82,19 @@ module UTCP
           [8, "big"] => "Q>", [8, "little"] => "Q<"
         }.fetch([template.length_prefix_bytes, template.length_prefix_endian])
         length = prefix.unpack1(unpack)
-        raise ToolCallError, "TCP response exceeds max_response_size" if length > template.max_response_size
+        raise ToolCallError, "TCP response exceeds max_response_bytes or max_response_size" if length > maximum
 
         read_exact(socket, length, deadline)
       when "delimiter"
         read_until(socket, escaped_delimiter(template.message_delimiter, template.interpret_escape_sequences),
-                   template.max_response_size, deadline)
+                   maximum, deadline)
       when "fixed_length"
+        if template.fixed_message_length > maximum
+          raise ToolCallError, "TCP response exceeds max_response_bytes or max_response_size"
+        end
         read_exact(socket, template.fixed_message_length, deadline)
       when "stream"
-        read_stream(socket, template.max_response_size, deadline)
+        read_stream(socket, maximum, deadline)
       end
     end
 
@@ -112,25 +116,33 @@ module UTCP
       raise ValidationError, "message_delimiter cannot be empty" if delimiter.empty?
 
       result = +"".b
-      until result.end_with?(delimiter)
-        raise ToolCallError, "TCP response exceeds max_response_size" if result.bytesize >= maximum
+      loop do
+        if (index = result.index(delimiter))
+          raise ToolCallError, "TCP response exceeds max_response_bytes or max_response_size" if index > maximum
+          return result.byteslice(0, index)
+        end
+        if result.bytesize >= maximum + delimiter.bytesize
+          raise ToolCallError, "TCP response exceeds max_response_bytes or max_response_size"
+        end
 
         wait_readable!(socket, deadline, "TCP read")
-        result << socket.readpartial([4096, maximum - result.bytesize].min)
+        result << socket.readpartial([4096, maximum + delimiter.bytesize - result.bytesize].min)
       end
-      result.byteslice(0, result.bytesize - delimiter.bytesize)
     rescue EOFError
       raise ToolCallError, "TCP connection closed before the message delimiter"
     end
 
     def read_stream(socket, maximum, deadline)
       result = +"".b
-      while result.bytesize < maximum
+      loop do
         remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
         break unless remaining.positive? && IO.select([socket], nil, nil, remaining)
 
         begin
-          result << socket.readpartial([4096, maximum - result.bytesize].min)
+          result << socket.readpartial([4096, maximum + 1 - result.bytesize].min)
+          if result.bytesize > maximum
+            raise ToolCallError, "TCP response exceeds max_response_bytes or max_response_size"
+          end
         rescue EOFError
           break
         end

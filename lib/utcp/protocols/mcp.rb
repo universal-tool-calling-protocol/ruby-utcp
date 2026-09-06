@@ -7,12 +7,14 @@ module UTCP
     MAX_MESSAGE_BYTES = 16 * 1024 * 1024
     MAX_STDERR_BYTES = 64 * 1024
 
-    def initialize(config, timeout, max_message_bytes: MAX_MESSAGE_BYTES)
+    def initialize(config, timeout, max_message_bytes: MAX_MESSAGE_BYTES, max_response_bytes: nil)
       @timeout = Float(timeout)
       raise ValidationError, "MCP timeout must be finite and greater than zero" unless @timeout.finite? && @timeout.positive?
 
       @max_message_bytes = Integer(max_message_bytes)
       raise ValidationError, "MCP message limit must be greater than zero" unless @max_message_bytes.positive?
+      @max_response_bytes = max_response_bytes.nil? ? @max_message_bytes : Integer(max_response_bytes)
+      raise ValidationError, "MCP response limit must be greater than zero" unless @max_response_bytes.positive?
 
       command = config["command"]
       command = command.first if command.is_a?(Array)
@@ -41,8 +43,9 @@ module UTCP
         message = { "jsonrpc" => "2.0", "id" => identifier, "method" => method }
         message["params"] = params unless params.nil?
         write_message(message, deadline)
+        budget = ResponseByteBudget.new(@max_response_bytes, "MCP stdio")
         loop do
-          response = read_message(deadline)
+          response = read_message(deadline, budget)
           next unless response["id"] == identifier
           raise ToolCallError, "MCP error #{response["error"].inspect}" if response["error"]
 
@@ -99,20 +102,22 @@ module UTCP
       raise ToolCallError, "MCP stdio write failed: #{error.message}"
     end
 
-    def read_message(deadline)
+    def read_message(deadline, budget = ResponseByteBudget.new(@max_response_bytes, "MCP stdio"))
       loop do
         remaining_time(deadline)
         if (index = @read_buffer.index("\n"))
-          response = JSON.parse(@read_buffer.slice!(0, index + 1))
+          bytes = @read_buffer.slice!(0, index + 1)
+          budget.consume(bytes)
+          response = JSON.parse(bytes)
           raise SerializerValidationError, "MCP stdio response must be an object" unless response.is_a?(Hash)
 
           return response
         end
-        if @read_buffer.bytesize >= @max_message_bytes
-          raise SerializerValidationError, "MCP stdio message exceeds #{@max_message_bytes} bytes"
+        if @read_buffer.bytesize >= budget.remaining
+          raise SerializerValidationError, "MCP stdio message exceeds #{@max_response_bytes} bytes (max_response_bytes)"
         end
 
-        chunk = @stdout.read_nonblock([4096, @max_message_bytes - @read_buffer.bytesize].min, exception: false)
+        chunk = @stdout.read_nonblock([4096, budget.remaining - @read_buffer.bytesize].min, exception: false)
         case chunk
         when :wait_readable then wait_for_io(deadline)
         when nil then raise ToolCallError, "MCP stdio server closed the stream"
@@ -211,7 +216,7 @@ module UTCP
       values = []
       parser = SSEParser.new
       parser.feed(body) { |value| values << value }
-      parser.finish { |value| values << value }
+      parser.finish
       values
     end
   end
@@ -229,10 +234,11 @@ module UTCP
       assert_mcp_template!(template)
       tools = []
       errors = []
+      budget = ResponseByteBudget.new(template.max_response_bytes, "MCP discovery")
       template.servers.each do |server_name, config|
         begin
           session = session_for(client, template, server_name, config)
-          each_list_item(session, "tools/list", "tools") do |tool|
+          each_list_item(session, "tools/list", "tools", budget) do |tool|
             tools << Tool.new(
               name: "#{server_name}.#{tool.fetch("name")}",
               description: tool["description"].to_s,
@@ -241,7 +247,7 @@ module UTCP
               tool_call_template: template
             )
           end
-          add_resource_tools(client, template, server_name, session, tools) if template.register_resources_as_tools
+          add_resource_tools(client, template, server_name, session, tools, budget) if template.register_resources_as_tools
         rescue StandardError => error
           errors << "#{server_name}: #{error.message}"
         end
@@ -280,6 +286,7 @@ module UTCP
                else
                  session.request("tools/call", "name" => local_name, "arguments" => Utils.stringify_keys(tool_args || {}))
                end
+      ResponseByteBudget.new(template.max_response_bytes, "MCP").consume_value(result)
       process_mcp_result(result, tool_name: tool_name)
     rescue Error
       raise
@@ -308,7 +315,7 @@ module UTCP
         body: message,
         content_type: "application/json",
         timeout: template.timeout,
-        sensitive_headers: sensitive.uniq
+        sensitive_headers: sensitive.uniq, max_response_bytes: template.max_response_bytes
       )
       {
         body: response.body.to_s,
@@ -330,7 +337,7 @@ module UTCP
       assert_no_auth!(template, context: "MCP stdio") unless http_transport || @session_factory
       # A session belongs to the credentials and endpoint used to initialize it.
       fingerprint = Digest::SHA256.hexdigest(JSON.generate([
-        config, template.auth&.to_h, template.protocol_version, template.timeout
+        config, template.auth&.to_h, template.protocol_version, template.timeout, template.max_response_bytes
       ]))
       key = [client, template.name, server_name, fingerprint]
       @sessions_mutex.synchronize do
@@ -343,7 +350,7 @@ module UTCP
                   elsif http_transport
                     MCPHTTPSession.new(server_config, snapshot, self)
                   else
-                    MCPStdioSession.new(server_config, snapshot.timeout)
+                    MCPStdioSession.new(server_config, snapshot.timeout, max_response_bytes: snapshot.max_response_bytes)
                   end
         begin
           initialize_session(session, snapshot)
@@ -356,20 +363,22 @@ module UTCP
     end
 
     def initialize_session(session, template)
-      session.request("initialize", {
+      response = session.request("initialize", {
         "protocolVersion" => template.protocol_version,
         "capabilities" => {},
         "clientInfo" => { "name" => "ruby-utcp", "version" => VERSION }
       })
+      ResponseByteBudget.new(template.max_response_bytes, "MCP initialization").consume_value(response)
       session.notify("notifications/initialized", {})
     end
 
-    def each_list_item(session, method, collection)
+    def each_list_item(session, method, collection, budget)
       cursor = nil
       seen = {}
       loop do
         params = cursor.nil? ? {} : { "cursor" => cursor }
         result = Utils.hash!(session.request(method, params) || {}, "MCP #{method} result")
+        budget.consume_value(result)
         Utils.array!(result.fetch(collection, []), "MCP #{collection}").each { |item| yield item }
         cursor = result["nextCursor"]
         break if cursor.nil?
@@ -381,8 +390,8 @@ module UTCP
       end
     end
 
-    def add_resource_tools(client, template, server_name, session, tools)
-      each_list_item(session, "resources/list", "resources") do |resource|
+    def add_resource_tools(client, template, server_name, session, tools, budget)
+      each_list_item(session, "resources/list", "resources", budget) do |resource|
         safe_name = resource.fetch("name", resource.fetch("uri")).to_s.gsub(/[^[:alnum:]_]/, "_")
         local_name = "resource_#{safe_name}"
         @sessions_mutex.synchronize do

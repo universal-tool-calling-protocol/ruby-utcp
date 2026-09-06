@@ -9,7 +9,8 @@ module UTCP
       perform_request(
         parts[:method], parts[:uri], headers: parts[:headers], cookies: parts[:cookies],
         body: parts[:body], content_type: parts[:content_type], timeout: parts[:timeout],
-        sensitive_headers: parts[:sensitive_headers]
+        sensitive_headers: parts[:sensitive_headers], max_response_bytes: template.max_response_bytes,
+        deadline: response_deadline(template.total_timeout || parts[:timeout])
       )
     end
 
@@ -31,9 +32,12 @@ module UTCP
           JSON.generate(parts[:body]) : parts[:body].to_s
       end
 
-      send_stream_request(parts[:uri], request, parts[:timeout]) do |response|
-        validate_stream_response!(response)
-        yield response
+      with_response_timeout(template.total_timeout) do
+        send_stream_request(parts[:uri], request, parts[:timeout]) do |response|
+          limited = LimitedHTTPResponse.new(response, template.max_response_bytes)
+          validate_stream_response!(limited)
+          yield limited
+        end
       end
     rescue Net::OpenTimeout, Net::ReadTimeout => error
       raise TimeoutError, "Streaming HTTP request timed out: #{error.message}"
@@ -41,6 +45,10 @@ module UTCP
       raise
     rescue SocketError, IOError, SystemCallError, OpenSSL::SSL::SSLError => error
       raise ToolCallError, "Streaming HTTP request failed: #{error.message}"
+    end
+
+    def with_collection_timeout(template, &block)
+      with_response_timeout(template.total_timeout || protocol_timeout_seconds(template, false), &block)
     end
 
     def http_parts(template, arguments, discovery:, accept: nil)
@@ -100,6 +108,7 @@ module UTCP
       http.verify_mode = OpenSSL::SSL::VERIFY_PEER if http.use_ssl?
       http.open_timeout = [Float(timeout), 10].min
       http.read_timeout = Float(timeout)
+      http.write_timeout = Float(timeout) if http.respond_to?(:write_timeout=)
       http.start do |connection|
         connection.request(request) { |response| yield response }
       end

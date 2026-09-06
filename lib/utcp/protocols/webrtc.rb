@@ -2,27 +2,45 @@
 
 module UTCP
   class WebRTCPeer
-    def initialize(template)
-      gem "webrtc-ruby", ">= 1.0.0"
-      require "webrtc"
-      WebRTC.init
+    def initialize(template, connection: nil)
       @template = template
       @mutex = Mutex.new
       @condition = ConditionVariable.new
-      @responses = {}
+      @pending = {}
+      @io_mutex = Mutex.new
+      @closed = false
       @candidates = []
-      configuration = { disable_auto_negotiation: true }
+      configuration = { disable_auto_negotiation: true, max_message_size: template.max_response_bytes }
       configuration[:ice_servers] = template.ice_servers unless template.ice_servers.empty?
-      @connection = WebRTC::RTCPeerConnection.new(configuration)
+      unless connection
+        gem "webrtc-ruby", ">= 1.0.0"
+        require "webrtc"
+        require_relative "webrtc_native_cleanup"
+        WebRTC.init
+        @native_cleanup = WebRTCNativeCleanup.new
+        connection = WebRTC::RTCPeerConnection.new(configuration)
+      end
+      @connection = connection
       install_candidate_handler
       @channel = @connection.create_data_channel(template.data_channel_name)
       install_channel_handlers
     rescue LoadError => error
+      close
       raise MissingDependencyError,
             "WebRTC requires the optional 'webrtc-ruby' gem and libdatachannel: #{error.message}"
+    rescue StandardError
+      close
+      raise
     end
 
     def connect
+      @io_mutex.synchronize do
+        @mutex.synchronize { assert_open! }
+        connect_peer
+      end
+    end
+
+    def connect_peer
       offer = @connection.create_offer.await
       # webrtc-ruby creates and installs the local offer in one native operation.
       wait_for_ice_gathering
@@ -34,38 +52,82 @@ module UTCP
       rescue StandardError
         nil
       end
-      @candidates.each { |candidate| post_candidate(candidate) }
+      @mutex.synchronize { @candidates.dup }.each { |candidate| post_candidate(candidate) }
       wait_for_channel
       response
     end
 
     def request(payload, timeout: @template.timeout)
       identifier = payload.fetch("id")
-      @channel.send_text(JSON.generate(payload))
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+      state = { deadline: deadline }
       @mutex.synchronize do
-        until @responses.key?(identifier)
+        assert_open!
+        raise ValidationError, "Duplicate WebRTC request id" if @pending.key?(identifier)
+        if @pending.length >= @template.max_pending_requests
+          raise ToolCallError, "WebRTC exceeds max_pending_requests"
+        end
+        @pending[identifier] = state
+      end
+      @io_mutex.synchronize do
+        @mutex.synchronize { assert_open! }
+        @channel.send_text(JSON.generate(payload))
+      end
+      @mutex.synchronize do
+        loop do
+          assert_open!
+          return state[:response] if state.key?(:response)
           remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
           raise TimeoutError, "WebRTC response timed out" unless remaining.positive?
           @condition.wait(@mutex, remaining)
         end
-        @responses.delete(identifier)
       end
+    ensure
+      @mutex.synchronize { @pending.delete(identifier) if @pending[identifier].equal?(state) }
     end
 
     def close
-      @channel.close if @channel
-      @channel.destroy if @channel&.respond_to?(:destroy)
-      @connection.close if @connection
-    rescue StandardError
+      @mutex.synchronize do
+        return nil if @closed
+        @closed = true
+        @pending.clear
+        @candidates.clear
+        @condition.broadcast
+      end
+      @io_mutex.synchronize do
+        if @native_cleanup
+          @native_cleanup.close(@channel, @connection)
+        else
+          begin
+            @channel.close if @channel
+            @channel.destroy if @channel&.respond_to?(:destroy)
+          ensure
+            @connection.close if @connection
+          end
+        end
+      end
       nil
     end
 
     private
 
+    private :connect_peer
+
+    def assert_open!
+      raise ToolCallError, "WebRTC peer closed" if @closed
+      raise ToolCallError, @failure if @failure
+    end
+
+    def fail_peer(message)
+      @mutex.synchronize do
+        @failure ||= message unless @closed
+        @condition.broadcast
+      end
+    end
+
     def install_candidate_handler
       @connection.on_ice_candidate do |candidate|
-        @mutex.synchronize { @candidates << candidate } if candidate
+        @mutex.synchronize { @candidates << candidate unless @closed } if candidate
       end
     end
 
@@ -73,15 +135,24 @@ module UTCP
       @channel_open = false
       @channel.on_open do
         @mutex.synchronize do
-          @channel_open = true
+          @channel_open = true unless @closed
           @condition.broadcast
         end
       end
+      @channel.on_close { fail_peer("WebRTC channel closed") } if @channel.respond_to?(:on_close)
       @channel.on_message do |message|
+        if message.data.bytesize > @template.max_response_bytes
+          fail_peer("WebRTC response exceeds max_response_bytes")
+          next
+        end
         envelope = JSON.parse(message.data)
+        next unless envelope.is_a?(Hash)
         identifier = envelope["id"]
         @mutex.synchronize do
-          @responses[identifier] = envelope.key?("result") ? envelope["result"] : envelope
+          state = @pending[identifier]
+          next unless state && !@closed && !state.key?(:response)
+          next if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= state[:deadline]
+          state[:response] = envelope.key?("result") ? envelope["result"] : envelope
           @condition.broadcast
         end
       rescue JSON::ParserError
@@ -93,9 +164,9 @@ module UTCP
       return unless @connection.respond_to?(:on_ice_gathering_state_change)
 
       complete = @connection.ice_gathering_state == :complete
-      @connection.on_ice_gathering_state_change do
+      @connection.on_ice_gathering_state_change do |state|
         @mutex.synchronize do
-          complete = @connection.ice_gathering_state == :complete
+          complete = state == :complete
           @condition.broadcast if complete
         end
       end
@@ -112,7 +183,9 @@ module UTCP
     def wait_for_flag(timeout)
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
       @mutex.synchronize do
-        until yield
+        loop do
+          assert_open!
+          return if yield
           remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
           raise TimeoutError, "WebRTC connection timed out" unless remaining.positive?
           @condition.wait(@mutex, remaining)
@@ -138,7 +211,14 @@ module UTCP
       http.verify_mode = OpenSSL::SSL::VERIFY_PEER if http.use_ssl?
       http.open_timeout = [@template.timeout, 10].min
       http.read_timeout = @template.timeout
-      response = http.start { |connection| connection.request(request) }
+      http.write_timeout = @template.timeout if http.respond_to?(:write_timeout=)
+      response = Timeout.timeout(@template.timeout, TimeoutError, "WebRTC signaling timed out") do
+        http.start do |connection|
+          connection.request(request) do |incoming|
+            incoming.body = LimitedHTTPResponse.new(incoming, @template.max_response_bytes).body
+          end
+        end
+      end
       unless response.code.to_i.between?(200, 299)
         raise ToolCallError.new("WebRTC signaling failed with status #{response.code}",
                                 status: response.code.to_i, response_body: response.body)
@@ -159,6 +239,7 @@ module UTCP
     def register_manual(client, template)
       assert_webrtc_template!(template)
       response = peer_for(client, template).connect
+      ResponseByteBudget.new(template.max_response_bytes, "WebRTC discovery").consume_value(response)
       payload = if response.is_a?(Hash) && response.key?("tools") && !response.key?("utcp_version")
                   {
                     "utcp_version" => VERSION,
@@ -187,7 +268,7 @@ module UTCP
     def call_tool(client, tool_name, tool_args, template)
       assert_webrtc_template!(template)
       identifier = SecureRandom.uuid
-      peer_for(client, template).request(
+      response = peer_for(client, template).request(
         {
           "id" => identifier,
           "tool" => tool_name.to_s.split(".").last,
@@ -195,6 +276,7 @@ module UTCP
         },
         timeout: template.timeout
       )
+      ResponseByteBudget.new(template.max_response_bytes, "WebRTC").consume_value(response)
     rescue Error
       raise
     rescue StandardError => error
@@ -214,7 +296,8 @@ module UTCP
     end
 
     def peer_key(client, template)
-      [client, template.name, template.signaling_server, template.peer_id, template.data_channel_name]
+      [client, template.name, template.signaling_server, template.peer_id, template.data_channel_name,
+       template.max_response_bytes, template.max_pending_requests]
     end
   end
   WebrtcCommunicationProtocol = WebRTCProtocol

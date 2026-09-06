@@ -28,10 +28,12 @@ module UTCP
     GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
     MAX_HEADER_SIZE = 65_536
     MAX_MESSAGE_SIZE = 16 * 1024 * 1024
+    attr_accessor :max_response_bytes
 
     def initialize(url, headers = {}, protocol = nil, timeout = 30)
       @uri = WebSocketURLSecurity.validate!(url)
       @timeout = Float(timeout)
+      @max_response_bytes = MAX_MESSAGE_SIZE
       @read_buffer = +"".b
       @closed = false
       open_socket
@@ -57,7 +59,7 @@ module UTCP
       message = +"".b
       message_opcode = nil
       loop do
-        fin, opcode, payload = read_frame
+        fin, opcode, payload = read_frame(@max_response_bytes - message.bytesize)
         case opcode
         when 0x0
           raise ToolCallError, "unexpected WebSocket continuation frame" unless message_opcode
@@ -78,9 +80,12 @@ module UTCP
         else
           raise ToolCallError, "unsupported WebSocket opcode #{opcode}"
         end
-        raise ToolCallError, "WebSocket message exceeds #{MAX_MESSAGE_SIZE} bytes" if message.bytesize > MAX_MESSAGE_SIZE
+        raise ToolCallError, "WebSocket message exceeds max_response_bytes" if message.bytesize > @max_response_bytes
         return [message_opcode, message] if fin
       end
+    rescue Error
+      close
+      raise
     end
 
     def close
@@ -198,7 +203,7 @@ module UTCP
       @socket.write(header + mask + masked)
     end
 
-    def read_frame
+    def read_frame(remaining = @max_response_bytes)
       head = read_exact(2)
       first, second = head.unpack("CC")
       fin = (first & 0x80) != 0
@@ -207,7 +212,8 @@ module UTCP
       length = second & 0x7F
       length = read_exact(2).unpack1("n") if length == 126
       length = read_exact(8).unpack1("Q>") if length == 127
-      raise ToolCallError, "WebSocket frame exceeds #{MAX_MESSAGE_SIZE} bytes" if length > MAX_MESSAGE_SIZE
+      maximum = opcode >= 8 ? 125 : remaining
+      raise ToolCallError, "WebSocket frame exceeds max_response_bytes" if length > maximum
 
       mask = masked ? read_exact(4) : nil
       payload = read_exact(length)
@@ -220,7 +226,7 @@ module UTCP
     def read_exact(length)
       while @read_buffer.bytesize < length
         wait_readable
-        @read_buffer << @socket.readpartial([4096, length - @read_buffer.bytesize].max)
+        @read_buffer << @socket.readpartial([4096, length - @read_buffer.bytesize].min)
       end
       @read_buffer.slice!(0, length)
     rescue EOFError
@@ -255,8 +261,10 @@ module UTCP
       assert_websocket_template!(template)
       entry, transient = connection_for(client, template, {})
       payload = entry.mutex.synchronize do
+        configure_response_limit(entry.connection, template)
         entry.connection.send_text(JSON.generate("type" => "utcp"))
         _opcode, bytes = entry.connection.read_message
+        ResponseByteBudget.new(template.max_response_bytes, "WebSocket").consume(bytes)
         bytes
       end
       success(template, manual_from_payload(template, payload, source: "WebSocket discovery response"))
@@ -283,11 +291,13 @@ module UTCP
       args = Utils.stringify_keys(tool_args || {})
       entry, transient, message_args = connection_for(client, template, args, include_arguments: true)
       result = entry.mutex.synchronize do
+        configure_response_limit(entry.connection, template)
         message = format_message(template, message_args)
         entry.connection.send_text(message)
         frame = entry.connection.read_message
         raise ToolCallError, "WebSocket closed without a response" unless frame
 
+        ResponseByteBudget.new(template.max_response_bytes, "WebSocket").consume(frame[1])
         decode_message(frame[1], template.response_format, frame[0])
       end
       result
@@ -300,6 +310,10 @@ module UTCP
     end
 
     private
+
+    def configure_response_limit(connection, template)
+      connection.max_response_bytes = template.max_response_bytes if connection.respond_to?(:max_response_bytes=)
+    end
 
     def assert_websocket_template!(template)
       return if template.is_a?(WebSocketCallTemplate)

@@ -130,18 +130,33 @@ class NativeGRPCTest < Minitest::Test
     error = assert_raises(UTCP::ToolCallError) { UTCP::GRPCProtocol.new.call_tool(nil, "echo", { slow: true }, template) }
     assert_match(/deadline/i, error.message)
   end
+
+  def test_real_response_limit_and_stream_budget
+    protocol = UTCP::GRPCProtocol.new
+    template = UTCP::GrpcCallTemplate.new(host: "127.0.0.1", port: @port, use_ssl: false, max_response_bytes: 64)
+    assert_raises(UTCP::ToolCallError) { protocol.call_tool(nil, "echo", { payload: "x" * 1000 }, template) }
+    assert_equal({ "authorization" => nil, "api_key" => nil }, protocol.call_tool(nil, "echo", {}, template))
+    values = []
+    error = assert_raises(UTCP::ToolCallError) do
+      protocol.call_tool_streaming(nil, "echo", {}, template).each { |value| values << value }
+    end
+    assert_match(/max_response_bytes/, error.message)
+    assert_equal 1, values.length
+    assert_equal 1, protocol.call_tool_streaming(nil, "echo", {}, template).take(1).length
+  end
 end
 
 class NativeWebRTCTest < Minitest::Test
   def setup
-    gem "webrtc-ruby", "1.0.0"
-    require "webrtc"
-    WebRTC.init
     @peers = []
     @peers_by_id = {}
     @channels = []
     @channel_closures = {}
     @clients = []
+    @received_requests = Queue.new
+    gem "webrtc-ruby", "1.0.0"
+    require "webrtc"
+    WebRTC.init
     @server = WEBrick::HTTPServer.new(BindAddress: "127.0.0.1", Port: 0, AccessLog: [],
                                     Logger: WEBrick::Log.new(File::NULL, WEBrick::Log::FATAL))
     @server.mount_proc("/connect") { |request, response| connect_peer(request, response) }
@@ -191,7 +206,9 @@ class NativeWebRTCTest < Minitest::Test
       @channels << channel
       channel.on_message do |message|
         envelope = JSON.parse(message.data)
+        @received_requests << envelope
         next if envelope.dig("args", "no_response")
+        sleep 0.1 if envelope.dig("args", "late_response")
         channel.send_text(JSON.generate(id: envelope["id"], result: envelope["args"]))
       end
     end
@@ -244,6 +261,71 @@ class NativeWebRTCTest < Minitest::Test
     client = new_client
     assert_raises(UTCP::TimeoutError) { client.call_tool("native.echo", no_response: true) }
     assert_equal({ "message" => "after timeout" }, client.call_tool("native.echo", message: "after timeout"))
+  end
+
+  def direct_peer
+    template = UTCP::WebRtcCallTemplate.new(
+      signaling_server: "http://127.0.0.1:#{@server.config[:Port]}", peer_id: "direct",
+      data_channel_name: "tools", timeout: 3
+    )
+    peer = UTCP::WebRTCPeer.new(template)
+    @clients << peer
+    peer.connect
+    peer
+  end
+
+  def test_adapter_close_releases_gvl_while_a_native_callback_finishes
+    peer = direct_peer
+    entered = Queue.new
+    release = Queue.new
+    channel = peer.instance_variable_get(:@channel)
+    channel.on_message do |_message|
+      entered << Thread.current
+      release.pop
+    end
+    channel.send_text(JSON.generate(id: "callback", tool: "echo", args: {}))
+    callback = Timeout.timeout(3) { entered.pop }
+    closer = Thread.new { peer.close }
+    Timeout.timeout(3) { Thread.pass while closer.alive? && closer.status != "sleep" }
+    assert closer.alive?, "native destruction must wait for the active callback"
+    assert_raises(UTCP::ToolCallError) { peer.request({ "id" => "closed" }) }
+    release << true
+    assert closer.join(3), "close must release Ruby so the callback can finish"
+    closer.value
+    assert callback.join(3)
+    assert_nil peer.close
+  ensure
+    release << true if release
+    closer&.join(3)
+  end
+
+  def test_adapter_close_cancels_an_in_flight_request
+    peer = direct_peer
+    worker = Thread.new do
+      peer.request({ "id" => "pending", "tool" => "echo", "args" => { "no_response" => true } })
+    rescue UTCP::ToolCallError => error
+      error
+    end
+    Timeout.timeout(3) { @received_requests.pop }
+    peer.close
+    assert worker.join(1), "pending request must stop before its response timeout"
+    assert_instance_of UTCP::ToolCallError, worker.value
+    assert_match(/closed/, worker.value.message)
+    assert_empty peer.instance_variable_get(:@pending)
+  ensure
+    worker&.kill&.join if worker&.alive?
+  end
+
+  def test_adapter_drops_late_responses_and_reuses_the_connection
+    peer = direct_peer
+    3.times do |index|
+      assert_raises(UTCP::TimeoutError) do
+        peer.request({ "id" => "late-#{index}", "tool" => "echo", "args" => { "late_response" => true } }, timeout: 0.02)
+      end
+      result = peer.request({ "id" => "next-#{index}", "tool" => "echo", "args" => { "index" => index } })
+      assert_equal index, result["index"]
+      assert_empty peer.instance_variable_get(:@pending)
+    end
   end
 end
 

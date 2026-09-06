@@ -16,7 +16,9 @@ module UTCP
 
     def call_tool(client, tool_name, tool_args, template)
       values = []
-      call_tool_streaming(client, tool_name, tool_args, template) { |value| values << value }
+      with_collection_timeout(template) do
+        call_tool_streaming(client, tool_name, tool_args, template) { |value| values << value }
+      end
       values
     end
 
@@ -25,11 +27,16 @@ module UTCP
 
       assert_sse_template!(template)
       with_stream_response(template, tool_args || {}, accept: "text/event-stream") do |response|
-        parser = SSEParser.new(event_type: template.event_type)
+        parser = SSEParser.new(event_type: template.event_type, max_event_bytes: template.max_event_bytes)
+        count = 0
         response.read_body do |chunk|
-          parser.feed(chunk) { |event| yield event }
+          parser.feed(chunk) do |event|
+            count += 1
+            raise ToolCallError, "SSE response exceeds max_response_items" if count > template.max_response_items
+            yield event
+          end
         end
-        parser.finish { |event| yield event }
+        parser.finish
       end
     rescue Error
       raise
@@ -47,30 +54,57 @@ module UTCP
   end
 
   class SSEParser
-    def initialize(event_type: nil)
+    def initialize(event_type: nil, max_event_bytes: ResponseLimits::DEFAULT_MAX_EVENT_BYTES)
       @event_type = event_type
-      @buffer = +""
+      @maximum = Integer(max_event_bytes)
+      raise ValidationError, "max_event_bytes must be greater than zero" unless @maximum.positive?
+      @buffer = +"".b
+      @skip_lf = false
+      @first_line = true
+      @event_bytes = 0
       @fields = reset_fields
     end
 
     def feed(chunk)
-      @buffer << chunk.to_s.gsub("\r\n", "\n").gsub("\r", "\n")
-      while (index = @buffer.index("\n"))
-        line = @buffer.slice!(0..index).chomp
-        process_line(line) { |event| yield event }
+      bytes = chunk.to_s.b
+      offset = 0
+      while offset < bytes.bytesize
+        if @skip_lf
+          @skip_lf = false
+          offset += 1 if bytes.getbyte(offset) == 10
+          next if offset == bytes.bytesize
+        end
+        index = bytes.index(/[\r\n]/, offset)
+        length = (index || bytes.bytesize) - offset
+        @event_bytes += length
+        raise ToolCallError, "SSE event exceeds max_event_bytes (#{@maximum})" if @event_bytes > @maximum
+        @buffer << bytes.byteslice(offset, length)
+        break unless index
+
+        line = @buffer
+        @buffer = +"".b
+        if @first_line
+          line = line.delete_prefix("\xEF\xBB\xBF".b)
+          @first_line = false
+        end
+        @skip_lf = bytes.getbyte(index) == 13
+        offset = index + 1
+        process_line(line.force_encoding(Encoding::UTF_8)) { |event| yield event }
       end
     end
 
     def finish
-      process_line(@buffer) { |event| yield event } unless @buffer.empty?
-      dispatch { |event| yield event } unless @fields[:data].empty?
+      # EOF is not an event delimiter; discard an unfinished event.
       @buffer.clear
+      @fields = reset_fields
+      @event_bytes = 0
     end
 
     private
 
     def process_line(line)
       if line.empty?
+        @event_bytes = 0
         dispatch { |event| yield event }
         return
       end
@@ -79,7 +113,9 @@ module UTCP
       field, value = line.split(":", 2)
       value = value.to_s.sub(/\A /, "")
       case field
-      when "data" then @fields[:data] << value
+      when "data"
+        @fields[:has_data] = true
+        @fields[:data] << value << "\n"
       when "event" then @fields[:event] = value
       when "id" then @fields[:id] = value unless value.include?("\0")
       when "retry" then @fields[:retry] = Integer(value) rescue nil
@@ -89,17 +125,20 @@ module UTCP
     def dispatch
       fields = @fields
       @fields = reset_fields
-      return if fields[:data].empty?
+      return unless fields[:has_data]
       return if @event_type && fields[:event] != @event_type
 
-      payload = fields[:data].join("\n")
-      yield JSON.parse(payload)
-    rescue JSON::ParserError
-      yield payload
+      payload = fields[:data].delete_suffix("\n")
+      value = begin
+        JSON.parse(payload)
+      rescue JSON::ParserError
+        payload
+      end
+      yield value
     end
 
     def reset_fields
-      { data: [], event: nil, id: nil, retry: nil }
+      { data: +"", has_data: false, event: nil, id: nil, retry: nil }
     end
   end
   SseCommunicationProtocol = SSEProtocol

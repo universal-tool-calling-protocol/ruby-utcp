@@ -1,6 +1,20 @@
 # Changelog
 
-## Unreleased
+## 1.1.6 (Unreleased)
+
+- Add configurable `max_response_bytes` (100 MiB by default) to every transport except file, CLI, and text. Bound discovery, protocol envelopes, streaming totals, UDP datagrams, and MCP pagination; retain TCP's stricter legacy size limit.
+- Add event/item limits and total deadlines for HTTP streams; bound buffered HTTP bodies during reads and cancel gRPC streams on early exit.
+- Parse SSE correctly across arbitrary CR/LF, BOM, and UTF-8 chunk boundaries, discard unfinished events at EOF, and preserve pretty-printed JSON sequences.
+- Resolve local OpenAPI parameter, body, response, and schema references, preserve recursive schemas, and resolve relative servers with operation/path precedence.
+- Retain only pending WebRTC responses, reject excess pending requests, discard late/unsolicited replies, and wake callers on close. Serialize native cleanup and release the GVL while destructors wait for callbacks, using UTCP-local bindings.
+- Add parser partition tests, byte-boundary transport checks, WebRTC concurrency regressions, and default native adapter lifecycle tests.
+
+## 1.1.5
+
+- Harden authentication across transports, including gRPC request metadata and streaming calls; reject unsupported auth configurations before transport I/O.
+- Protect OAuth token redirects and cache synchronization, isolate MCP sessions by credentials and endpoint, and test the authentication matrix at transport boundaries.
+
+## 1.1.4
 
 - Raise the Code Mode value budget to 30 MiB, account for string/symbol hash keys, and enforce shared byte, item, and step limits while collecting streams.
 - Close temporary discovery sessions when inspecting required variables, preserving active MCP, WebRTC, and WebSocket sessions. Isolate persistent WebSocket connections between clients and close transient discovery sockets on failure.

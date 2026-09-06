@@ -125,6 +125,21 @@ Complete runnable/configuration examples are in [examples/README.md](examples/RE
 
 Run `make` to start every available matching local server, execute its clients, and cleanly stop the servers. Missing optional gRPC/WebRTC backends are reported and skipped. `make full-demo` is the strict 12/12 target; `make standard-demo` always runs only the pairs that do not need native backends.
 
+### Response limits
+
+All transports except `file`, `cli`, and `text` include `UTCP::ResponseLimits`. Set `max_response_bytes` on a call template to bound incoming responses; the default is **100 MiB (104,857,600 bytes)**. The value must be positive and is preserved when templates are serialized. Discovery responses are bounded as well as tool responses. Exceeding the limit aborts the read with a UTCP error; responses are never silently truncated.
+
+```ruby
+template = UTCP::HttpCallTemplate.new(
+  url: "https://api.example.com/results",
+  max_response_bytes: 2 * 1024 * 1024
+)
+```
+
+The budget counts response bytes before JSON/protobuf decoding, including protocol envelopes but excluding transport framing such as WebSocket frame headers and TCP length prefixes/delimiters. HTTP counts decompressed body bytes. SSE, Streamable HTTP, gRPC streams, GraphQL subscriptions (including control messages), and UDP calls share one budget across their response items. MCP limits each JSON-RPC exchange, including stdio notifications and line separators; discovery additionally bounds the serialized results collected across pages and servers. TCP also retains its existing `max_response_size` limit; the smaller limit applies. WebRTC limits both signaling bodies and data-channel messages. Custom adapters are checked when they return their data and must enforce read limits themselves to prevent buffering oversized data internally.
+
+HTTP, SSE, and Streamable HTTP templates also accept `total_timeout` in seconds. Buffered HTTP exchanges, including redirects, default to the request timeout as a total deadline. Collecting an SSE or Streamable HTTP response with `call_tool` also has a total deadline. Direct `call_tool_streaming` enumeration has a total deadline only when `total_timeout` is set; the existing read timeout still applies between network reads. SSE and Streamable HTTP additionally default to `max_event_bytes: 1_048_576` and `max_response_items: 10_000`. These bound individual events/records and the number of emitted values; binary output is split into bounded chunks. Breaking out of an HTTP stream, GraphQL subscription, or gRPC stream releases its connection or cancels its RPC.
+
 ### Authentication by transport
 
 | Transport | Supported `auth` | Authentication checks |
@@ -256,13 +271,15 @@ MCP sessions implement initialization, notifications, `tools/list`, `tools/call`
 
 Sessions and resource mappings are isolated per client. Closing one client does not close another client's sessions, even when manual and server names match. Tool and resource discovery follows all result pages. An MCP result with `isError: true` raises `UTCP::ToolCallError`; the original result is available in `error.response_body`.
 
-For stdio, `timeout` bounds the complete request write and response read, including partial lines and intervening notifications. Messages are limited to 16 MiB, and stderr is drained while retaining only its last 64 KiB. Call `client.close` when finished to release server processes.
+For stdio, `timeout` bounds the complete request write and response read, including partial lines and intervening notifications. Outgoing messages are limited to 16 MiB; incoming messages and notifications share the template's `max_response_bytes` budget. Stderr is drained while retaining only its last 64 KiB. Call `client.close` when finished to release server processes.
 
 ### WebRTC
 
 WebRTC follows the reference signaling contract: `POST /connect` exchanges SDP and returns `sdp`, `candidates`, and `tools`; `POST /candidate` exchanges ICE candidates. DataChannel requests are JSON envelopes containing `id`, `tool`, and `args`, and responses correlate the same `id` with `result`.
 
 The built-in peer uses `webrtc-ruby` and `libdatachannel`. For another native stack, pass `peer_factory:` to `UTCP::WebRTCProtocol`; the adapter contract is demonstrated by the protocol tests.
+
+The built-in peer tracks only pending request IDs and discards unsolicited, duplicate, and late responses. `max_pending_requests` defaults to 1,024. Closing a peer wakes pending callers and serializes native destruction with connection setup and sends. UTCP uses local FFI bindings that release Ruby's GVL during native destruction, allowing outstanding callbacks to finish; it does not alter the installed gem's bindings.
 
 ### Text and file
 
@@ -390,4 +407,4 @@ CI runs the tests and gem build on Ruby 2.6, 2.7, 3.0–3.4, and 4.0. A separate
 
 A dedicated Ruby 3.4 CI job sets `UTCP_NATIVE_TESTS=1` to install the original, unmodified backends from the Gemfile, builds libdatachannel 0.24.5 and the WebRTC extension, and runs `bundle exec rake native`. The test subprocess has a 45-second watchdog. The native dependencies remain optional for applications using the gem.
 
-The default native suite checks discovery, real calls, streaming, concurrent requests, timeouts, and client isolation. Additional backend shutdown probes are opt-in with `UTCP_WEBRTC_SHUTDOWN_REGRESSIONS=1`; they require callback shutdown guarantees that the stock `webrtc-ruby` 1.0.0 release does not provide and are not part of the CI job. No WebRTC patches are installed or applied.
+The default native suite checks discovery, real calls, response limits, streaming, concurrent requests, timeouts, and client isolation. It also checks the UTCP WebRTC adapter's destruction during an active callback, cancellation of pending calls, and reuse after late responses. Additional probes of the upstream backend itself are opt-in with `UTCP_WEBRTC_SHUTDOWN_REGRESSIONS=1`; they require callback shutdown guarantees that stock `webrtc-ruby` 1.0.0 bindings do not provide and are not part of the CI job. No patches are installed into the dependency.

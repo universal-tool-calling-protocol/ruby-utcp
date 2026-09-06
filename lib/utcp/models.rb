@@ -4,6 +4,7 @@ require "securerandom"
 require_relative "version"
 require_relative "errors"
 require_relative "utils"
+require_relative "response_limits"
 
 module UTCP
   class JsonSchema
@@ -218,6 +219,7 @@ module UTCP
   end
 
   class HttpCallTemplate < CallTemplate
+    include HTTPResponseLimits
     METHODS = %w[GET POST PUT DELETE PATCH HEAD OPTIONS].freeze
     attr_accessor :http_method, :url, :content_type, :auth_tools, :headers, :body_field,
                   :header_fields, :timeout
@@ -236,6 +238,9 @@ module UTCP
       @body_field = body_field.nil? ? nil : body_field.to_s
       @header_fields = header_fields.nil? ? [] : Utils.array!(header_fields, "header_fields").map(&:to_s)
       @timeout = timeout.nil? ? nil : Float(timeout)
+      if @timeout && (!@timeout.finite? || !@timeout.positive?)
+        raise ValidationError.new("must be finite and greater than zero", path: "timeout")
+      end
     end
 
     def to_h
@@ -253,6 +258,7 @@ module UTCP
   end
 
   class SseCallTemplate < CallTemplate
+    include HTTPResponseLimits
     attr_accessor :url, :event_type, :reconnect, :retry_timeout, :headers, :body_field,
                   :header_fields, :timeout
 
@@ -288,6 +294,7 @@ module UTCP
   SSECallTemplate = SseCallTemplate
 
   class StreamableHttpCallTemplate < CallTemplate
+    include HTTPResponseLimits
     METHODS = %w[GET POST].freeze
     attr_accessor :url, :http_method, :content_type, :chunk_size, :timeout, :headers,
                   :body_field, :header_fields
@@ -327,6 +334,7 @@ module UTCP
   StreamableHTTPCallTemplate = StreamableHttpCallTemplate
 
   class WebSocketCallTemplate < CallTemplate
+    include ResponseLimits
     RESPONSE_FORMATS = %w[json text raw].freeze
     attr_accessor :url, :message, :protocol, :keep_alive, :response_format, :timeout,
                   :headers, :header_fields
@@ -365,6 +373,7 @@ module UTCP
   WebsocketCallTemplate = WebSocketCallTemplate
 
   class GrpcCallTemplate < CallTemplate
+    include ResponseLimits
     attr_accessor :host, :port, :service_name, :method_name, :target, :use_ssl,
                   :timeout, :metadata
 
@@ -406,6 +415,7 @@ module UTCP
   GRPCCallTemplate = GrpcCallTemplate
 
   class GraphQLCallTemplate < CallTemplate
+    include ResponseLimits
     OPERATION_TYPES = %w[query mutation subscription].freeze
     attr_accessor :url, :operation_type, :operation_name, :headers, :header_fields,
                   :query, :variable_types, :selection_set, :timeout
@@ -446,6 +456,7 @@ module UTCP
   GraphqlCallTemplate = GraphQLCallTemplate
 
   class TcpCallTemplate < CallTemplate
+    include ResponseLimits
     FORMATS = %w[json text].freeze
     FRAMING = %w[length_prefix delimiter fixed_length stream].freeze
     attr_accessor :host, :port, :request_data_format, :request_data_template,
@@ -512,6 +523,7 @@ module UTCP
   TCPCallTemplate = TcpCallTemplate
 
   class UdpCallTemplate < CallTemplate
+    include ResponseLimits
     FORMATS = %w[json text].freeze
     attr_accessor :host, :port, :number_of_response_datagrams, :request_data_format,
                   :request_data_template, :response_byte_format, :timeout
@@ -548,19 +560,23 @@ module UTCP
   UDPCallTemplate = UdpCallTemplate
 
   class WebRtcCallTemplate < CallTemplate
-    attr_accessor :signaling_server, :peer_id, :data_channel_name, :timeout, :ice_servers
+    include ResponseLimits
+    attr_accessor :signaling_server, :peer_id, :data_channel_name, :timeout, :ice_servers,
+                  :max_pending_requests
 
     def initialize(signaling_server:, peer_id:, data_channel_name:, call_template_type: "webrtc",
-                   timeout: 30, ice_servers: nil, **common)
+                   timeout: 30, ice_servers: nil, max_pending_requests: 1024, **common)
       super(call_template_type: call_template_type, auth: nil, **common)
       @signaling_server = Utils.required_string!(signaling_server, "signaling_server")
       @peer_id = Utils.required_string!(peer_id, "peer_id")
       @data_channel_name = Utils.required_string!(data_channel_name, "data_channel_name")
       @timeout = Float(timeout)
+      @max_pending_requests = Integer(max_pending_requests)
       @ice_servers = ice_servers.nil? ? [] : Utils.array!(ice_servers, "ice_servers").map do |server|
         Utils.stringify_keys(Utils.hash!(server, "ice_server"))
       end
-      raise ValidationError.new("must be greater than zero", path: "timeout") unless @timeout.positive?
+      raise ValidationError.new("must be finite and greater than zero", path: "timeout") unless @timeout.finite? && @timeout.positive?
+      raise ValidationError.new("must be greater than zero", path: "max_pending_requests") unless @max_pending_requests.positive?
     end
 
     def to_h
@@ -568,6 +584,7 @@ module UTCP
         "signaling_server" => signaling_server,
         "peer_id" => peer_id,
         "data_channel_name" => data_channel_name,
+        "max_pending_requests" => max_pending_requests,
         "timeout" => timeout,
         "ice_servers" => ice_servers.empty? ? nil : Utils.deep_copy(ice_servers)
       ))
@@ -576,6 +593,7 @@ module UTCP
   WebRTCCallTemplate = WebRtcCallTemplate
 
   class McpCallTemplate < CallTemplate
+    include ResponseLimits
     attr_accessor :config, :register_resources_as_tools, :protocol_version, :timeout
 
     def initialize(config:, call_template_type: "mcp", register_resources_as_tools: false,
