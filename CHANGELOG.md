@@ -1,6 +1,10 @@
 # Changelog
 
-## 1.1.6 (Unreleased)
+## 1.1.7
+
+- Add HTTP streaming and native WebRTC soak scenarios, with post-GC RSS/heap/object/thread/descriptor growth gates, workload counts, checkpointed JSON reports, and subprocess watchdogs. Run 60-second scenarios on CI pushes and pull requests; reserve full five-minute CI runs for manual dispatch. Preserve reports as artifacts.
+
+## 1.1.6
 
 - Add configurable `max_response_bytes` (100 MiB by default) to every transport except file, CLI, and text. Bound discovery, protocol envelopes, streaming totals, UDP datagrams, and MCP pagination; retain TCP's stricter legacy size limit.
 - Add event/item limits and total deadlines for HTTP streams; bound buffered HTTP bodies during reads and cancel gRPC streams on early exit.

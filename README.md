@@ -408,3 +408,33 @@ CI runs the tests and gem build on Ruby 2.6, 2.7, 3.0–3.4, and 4.0. A separate
 A dedicated Ruby 3.4 CI job sets `UTCP_NATIVE_TESTS=1` to install the original, unmodified backends from the Gemfile, builds libdatachannel 0.24.5 and the WebRTC extension, and runs `bundle exec rake native`. The test subprocess has a 45-second watchdog. The native dependencies remain optional for applications using the gem.
 
 The default native suite checks discovery, real calls, response limits, streaming, concurrent requests, timeouts, and client isolation. It also checks the UTCP WebRTC adapter's destruction during an active callback, cancellation of pending calls, and reuse after late responses. Additional probes of the upstream backend itself are opt-in with `UTCP_WEBRTC_SHUTDOWN_REGRESSIONS=1`; they require callback shutdown guarantees that stock `webrtc-ruby` 1.0.0 bindings do not provide and are not part of the CI job. No patches are installed into the dependency.
+
+### Sustained load and memory checks
+
+```sh
+bundle exec rake 'soak[http]'
+# Requires the same built native dependencies as the native CI job:
+UTCP_NATIVE_TESTS=1 bundle exec rake 'soak[webrtc]'
+```
+
+Local commands default to five minutes per scenario with eight concurrent callers. HTTP mixes SSE and NDJSON, complete reads, early enumeration exits, and oversized responses. WebRTC creates real peer pairs, checks concurrent response correlation, times out a late reply, verifies the next request, and closes a peer with a pending call from multiple threads. Both ends and fixture queues are reclaimed between WebRTC cycles. Missing native dependencies fail the command; they are never silently skipped or automatically downloaded.
+
+Reports are written to `tmp/soak/http.json` and `tmp/soak/webrtc.json`. They contain operation counts, configuration, Ruby/platform details, and resource samples taken at quiet batch boundaries after full GC. Measurements cover both the client and its local test server in one process: RSS, retained Ruby heap bytes, live Ruby objects, Ruby threads, and file descriptors. The first post-warmup sample is the baseline. Any later sample exceeding a growth limit fails the run, even if memory subsequently falls. These are sampled, post-GC measurements, not a continuous peak-RSS measurement or proof that no leak can occur in a longer or different workload.
+
+| Environment variable | Local default |
+| --- | --- |
+| `UTCP_SOAK_DURATION` | 300 seconds, including warmup |
+| `UTCP_SOAK_WARMUP` | 30 seconds |
+| `UTCP_SOAK_INTERVAL` | 10 seconds |
+| `UTCP_SOAK_CONCURRENCY` | 8, allowed range 1–64 |
+| `UTCP_SOAK_REQUESTS_PER_SECOND` | 200; `0` disables pacing |
+| `UTCP_SOAK_RSS_GROWTH_MIB` | 32 MiB |
+| `UTCP_SOAK_HEAP_GROWTH_MIB` | 8 MiB |
+| `UTCP_SOAK_OBJECT_GROWTH` | 20,000 objects |
+| `UTCP_SOAK_THREAD_GROWTH` | 4 threads |
+| `UTCP_SOAK_FD_GROWTH` | 4 descriptors |
+| `UTCP_SOAK_REPORT` | `tmp/soak/<scenario>.json` |
+
+Pacing prevents a connection-churn test from exhausting a CI host's ephemeral TCP ports. Increase duration for a longer run, for example `UTCP_SOAK_DURATION=1800 bundle exec rake 'soak[http]'`. Duration must allow warmup and at least three sample intervals. A parent-process watchdog allows an additional 60 seconds for setup and cleanup, then kills a stuck subprocess and records failure. Reports are checkpointed during the run, and failed subprocesses cannot reuse a stale passing report.
+
+On pushes and pull requests, CI runs each soak for 60 seconds, including a 10-second warmup. Full five-minute runs with a 30-second warmup are available only through manual dispatch: **Actions → CI → Run workflow**. Both modes sample every 10 seconds. The HTTP soak runs in a separate job and the WebRTC soak follows the native regression suite, using the existing pinned backend build. Both jobs upload their JSON reports as artifacts, including reports from failed runs when available.

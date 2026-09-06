@@ -327,6 +327,55 @@ class NativeWebRTCTest < Minitest::Test
       assert_empty peer.instance_variable_get(:@pending)
     end
   end
+
+  # Opt-in so the ordinary native suite keeps its 45-second watchdog.
+  if ENV["UTCP_NATIVE_SOAK"] == "1"
+    def test_native_webrtc_soak
+      require_relative "../support/soak_runner"
+      config = TransportSoak::Config.new
+      iteration = 0
+      pending = nil
+      TransportSoak::Runner.new("webrtc", config: config).run do
+        iteration += 1
+        peer = direct_peer
+        TransportSoak.parallel(config.concurrency) do |worker|
+          20.times do |index|
+            id = "#{iteration}-#{worker}-#{index}"
+            args = { "id" => id, "payload" => "zażółć" * 128 }
+            result = peer.request({ "id" => id, "tool" => "echo", "args" => args })
+            assert_equal args, result
+          end
+        end
+        assert_raises(UTCP::TimeoutError) do
+          peer.request({ "id" => "late", "tool" => "echo", "args" => { "late_response" => true } }, timeout: 0.005)
+        end
+        assert_equal({ "after" => "timeout" }, peer.request({ "id" => "after", "tool" => "echo", "args" => { "after" => "timeout" } }))
+        assert_empty peer.instance_variable_get(:@pending)
+
+        pending = Thread.new do
+          peer.request({ "id" => "cancel", "tool" => "echo", "args" => { "no_response" => true } })
+        rescue UTCP::ToolCallError => error
+          error
+        end
+        Timeout.timeout(3) do
+          loop { break if @received_requests.pop["id"] == "cancel" }
+        end
+        TransportSoak.parallel(config.concurrency) { peer.close }
+        assert pending.join(1), "close did not cancel the outstanding native call"
+        assert_instance_of UTCP::ToolCallError, pending.value
+        assert_empty peer.instance_variable_get(:@pending)
+
+        # Reclaim both ends and their fixture queues on every cycle. Otherwise
+        # retained test history would be indistinguishable from a library leak.
+        teardown
+        setup
+        { "requests" => config.concurrency * 20 + 3, "connections" => 1,
+          "expected_timeouts" => 1, "cancelled_requests" => 1 }
+      end
+    ensure
+      pending.kill.join if pending&.alive?
+    end
+  end
 end
 
 # Extra backend regression probes require shutdown guarantees absent from the

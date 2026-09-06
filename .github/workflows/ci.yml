@@ -3,9 +3,15 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  UTCP_SOAK_DURATION: ${{ github.event_name == 'workflow_dispatch' && '300' || '60' }}
+  UTCP_SOAK_WARMUP: ${{ github.event_name == 'workflow_dispatch' && '30' || '10' }}
+  UTCP_SOAK_INTERVAL: "10"
 
 jobs:
   test:
@@ -41,6 +47,24 @@ jobs:
         run: bundle exec rake coverage
       - name: Local transport integration tests
         run: bundle exec make standard-demo
+
+  transport-soak:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+      - name: HTTP stream and resource soak
+        run: bundle exec rake 'soak[http]'
+      - name: Preserve HTTP memory and workload measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: http-soak
+          path: tmp/soak/http.json
 
   native-transports:
     runs-on: ubuntu-22.04
@@ -82,3 +106,11 @@ jobs:
         env:
           TESTOPTS: --verbose
         run: bundle exec rake native
+      - name: Native WebRTC lifecycle and memory soak
+        run: bundle exec rake 'soak[webrtc]'
+      - name: Preserve WebRTC memory and workload measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webrtc-soak
+          path: tmp/soak/webrtc.json
