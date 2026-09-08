@@ -1,4 +1,5 @@
-# ruby-utcp
+<img width="1254" height="1254" alt="ChatGPT Image 8 wrz 2026 o 21_28_28" src="https://github.com/user-attachments/assets/b26acf3d-f2e2-4c0f-bff9-1a4915040309" />
+
 
 `ruby-utcp` is a Ruby implementation of the Universal Tool Calling Protocol (UTCP) 1.1. It discovers tools from UTCP manuals, stores and searches them locally, and calls them directly over their native protocol.
 
