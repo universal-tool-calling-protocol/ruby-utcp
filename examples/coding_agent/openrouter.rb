@@ -18,8 +18,8 @@ module CodingAgent
   end
 
   class OpenRouter
-    DEFAULT_MODEL = "inclusionai/ling-3.0-flash"
-    DEFAULT_MAX_TOKENS = 16_384
+    DEFAULT_MODEL = "inception/mercury-2.5"
+    DEFAULT_MAX_TOKENS = 60000
     ENDPOINT = URI("https://openrouter.ai/api/v1/chat/completions")
     RETRYABLE_STATUSES = [408, 429, 500, 502, 503, 504].freeze
 
@@ -32,6 +32,14 @@ module CodingAgent
       @model = model
       @max_tokens = max_tokens
       @sleeper = sleeper
+    end
+
+    def close
+      http = @http
+      @http = nil
+      http.finish if http && http.started?
+    rescue IOError, SystemCallError, OpenSSL::SSL::SSLError
+      nil
     end
 
     def complete(messages:, tools: nil)
@@ -127,9 +135,18 @@ module CodingAgent
     end
 
     def request_completion(request)
-      Net::HTTP.start(ENDPOINT.host, ENDPOINT.port, use_ssl: true, open_timeout: 10, read_timeout: 120) do |http|
-        http.request(request)
+      unless @http
+        @http = Net::HTTP.new(ENDPOINT.host, ENDPOINT.port)
+        @http.use_ssl = true
+        @http.open_timeout = 10
+        @http.read_timeout = 120
+        @http.keep_alive_timeout = 120
       end
+      @http.start unless @http.started?
+      @http.request(request)
+    rescue Timeout::Error, IOError, SystemCallError, SocketError, OpenSSL::SSL::SSLError
+      close
+      raise
     end
   end
 end

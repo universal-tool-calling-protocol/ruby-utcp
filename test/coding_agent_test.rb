@@ -121,7 +121,7 @@ class CodingAgentTest < Minitest::Test
     assert_equal "inclusionai/ling-3.0-flash", first["body"]["model"]
     refute first["body"]["provider"].key?("max_price")
     assert_equal true, first["body"].dig("provider", "require_parameters")
-    assert_equal 16_384, first["body"]["max_tokens"]
+    assert_equal CodingAgent::OpenRouter::DEFAULT_MAX_TOKENS, first["body"]["max_tokens"]
     router.requests.each do |request|
       tools = request["body"]["tools"]
       assert_equal ["execute_code"], tools.map { |tool| tool["function"]["name"] }
@@ -590,7 +590,7 @@ class CodingAgentTest < Minitest::Test
     assert_equal 3, router.requests.length
     messages = router.requests.last["body"]["messages"]
     assert_equal %w[system user user], messages.map { |message| message["role"] }
-    assert_includes messages.last["content"], "16384-token output limit"
+    assert_includes messages.last["content"], "#{CodingAgent::OpenRouter::DEFAULT_MAX_TOKENS}-token output limit"
     refute_includes JSON.generate(messages), "Unfinished document"
   end
 
@@ -662,5 +662,286 @@ class CodingAgentTest < Minitest::Test
     assert_equal 1, CodingAgent.run_cli(["--max-turns", "0", "task"], env: {}, output: @output, log: @log)
     assert_equal 1, CodingAgent.run_cli([], env: {}, output: @output, log: @log)
     assert_equal 1, CodingAgent.run_cli(["--bogus"], env: {}, output: @output, log: @log)
+  end
+
+  def test_initial_interfaces_allow_search_read_and_batch_edit_without_discovery_or_shell
+    File.write(File.join(@workspace, "math.rb"), "def add(a, b)\n  a - b\nend\n")
+    router = ScriptedOpenRouter.new([
+      code_response(<<~'RUBY'),
+        matches = codemode.call_tool("workspace.search_files", path: ".", query: "def add", glob: "*.rb", offset: 0)
+        source = codemode.call_tool("workspace.read_files", files: [{path: matches["matches"][0]["path"]}])
+        file = source["files"][0]
+        codemode.call_tool("workspace.edit_file_batch", path: file["path"], expected_sha256: file["sha256"],
+          edits: [{old_text: "a - b", new_text: "a + b"}, {old_text: "def add", new_text: "def sum"}])
+      RUBY
+      final_response("FINAL: Fixed the implementation. Tests were not run.")
+    ])
+    agent(router, response_mode: :code).run("Fix and rename addition")
+    assert_equal "def sum(a, b)\n  a + b\nend\n", File.read(File.join(@workspace, "math.rb"))
+    assert_equal 2, router.requests.length
+    prompt = router.requests.first["body"]["messages"].first["content"]
+    assert_includes prompt, 'codemode.call_tool("workspace.search_files", path:, query:, glob:, offset:)'
+    assert_includes prompt, 'codemode.call_tool("workspace.read_files", files:)'
+    refute_includes prompt, 'codemode.call_tool("workspace.run_command"'
+    assert_includes @log.string, "[Tool 1.3: workspace.edit_file_batch output]"
+  end
+
+  def test_find_files_recurses_with_globs_and_stable_pagination
+    FileUtils.mkdir_p(File.join(@workspace, "lib/nested"))
+    File.write(File.join(@workspace, "root.rb"), "root")
+    File.write(File.join(@workspace, "lib/nested/target.rb"), "target")
+    File.write(File.join(@workspace, "lib/nested/notes.txt"), "notes")
+    expected = ["lib/nested/target.rb", "root.rb"]
+    %w[*.rb **/*.rb].each do |glob|
+      result = call("find_files", path: ".", glob: glob, offset: 0)
+      assert_equal expected, result["files"], result.inspect
+      refute result["truncated"]
+      assert_nil result["next_offset"]
+    end
+    assert_equal [expected.first], call("find_files", path: "lib", glob: "nested/*.rb", offset: 0)["files"]
+    205.times { |number| File.write(File.join(@workspace, format("file%03d.txt", number)), "") }
+    first = call("find_files", path: ".", glob: "file*.txt", offset: 0)
+    assert_equal 200, first["files"].length
+    assert_equal 200, first["next_offset"]
+    assert first["truncated"]
+    second = call("find_files", path: ".", glob: "file*.txt", offset: first["next_offset"])
+    assert_equal (0...205).map { |number| format("file%03d.txt", number) }, first["files"] + second["files"]
+    refute second["truncated"]
+    assert_nil second["next_offset"]
+  end
+
+  def test_search_is_literal_and_reports_line_numbers_excerpts_and_skipped_files
+    FileUtils.mkdir_p(File.join(@workspace, "src"))
+    File.write(File.join(@workspace, "src/code.rb"), "needle-anything\nneedle.* café\n" + "é" * 2000 + "needle.* end\n")
+    File.binwrite(File.join(@workspace, "binary.rb"), "needle.*\0")
+    File.binwrite(File.join(@workspace, "large.rb"), "x" * (CodingAgent::WorkspaceTools::MAX_FILE_BYTES + 1))
+    result = call("search_files", path: ".", query: "needle.*", glob: "*.rb", offset: 0)
+    assert_equal [2, 3], result["matches"].map { |match| match["line"] }
+    assert_equal ["src/code.rb"], result["matches"].map { |match| match["path"] }.uniq
+    assert_equal "needle.* café", result["matches"][0]["text"]
+    refute result["matches"][0]["text_truncated"]
+    assert_includes result["matches"][1]["text"], "needle.* end"
+    assert result["matches"][1]["text"].valid_encoding?
+    assert result["matches"][1]["text_truncated"]
+    assert_equal 2, result["skipped_files"]
+    refute result["scan_truncated"]
+  end
+
+  def test_search_pages_respect_the_serialized_byte_budget_without_losing_matches
+    File.write(File.join(@workspace, "quoted.txt"), ("needle " + '"' * 990 + "\n") * 45)
+    lines = []
+    offset = 0
+    loop do
+      result = call("search_files", path: ".", query: "needle", glob: "*.txt", offset: offset)
+      assert_operator JSON.generate(result["matches"]).bytesize, :<=, CodingAgent::WorkspaceTools::MAX_OUTPUT_BYTES
+      lines.concat(result["matches"].map { |match| match["line"] })
+      break unless result["next_offset"]
+
+      assert_operator result["next_offset"], :>, offset
+      offset = result["next_offset"]
+    end
+    assert_equal (1..45).to_a, lines
+  end
+
+  def test_navigation_rejects_escape_paths_and_skips_symlinks_and_dependency_directories
+    Dir.mktmpdir("utcp outside") do |outside|
+      File.write(File.join(outside, "secret.rb"), "needle")
+      File.symlink(outside, File.join(@workspace, "link"))
+      File.symlink(File.join(outside, "secret.rb"), File.join(@workspace, "linked.rb"))
+      CodingAgent::WorkspaceTools::HIDDEN_DIRECTORIES.each do |directory|
+        FileUtils.mkdir_p(File.join(@workspace, directory))
+        File.write(File.join(@workspace, directory, "hidden.rb"), "needle")
+      end
+      assert_empty call("find_files", path: ".", glob: "**/*", offset: 0)["files"]
+      assert_empty call("search_files", path: ".", query: "needle", glob: "**/*", offset: 0)["matches"]
+      ["../", "link", ".git", outside].each do |path|
+        assert call("find_files", path: path, glob: "**/*", offset: 0).key?("error"), path
+        assert call("search_files", path: path, query: "needle", glob: "**/*", offset: 0).key?("error"), path
+      end
+    end
+    assert call("find_files", path: ".", glob: "", offset: 0).key?("error")
+    assert call("find_files", path: ".", glob: "**/*", offset: -1).key?("error")
+    assert call("search_files", path: ".", query: "", glob: "**/*", offset: 0).key?("error")
+  end
+
+  def with_workspace_tool_limit(name, value)
+    klass = CodingAgent::WorkspaceTools
+    original = klass.const_get(name)
+    klass.send(:remove_const, name)
+    klass.const_set(name, value)
+    yield CodingAgent::WorkspaceTools.new(@workspace)
+  ensure
+    klass.send(:remove_const, name)
+    klass.const_set(name, original)
+  end
+
+  def test_navigation_discloses_scan_limits_instead_of_claiming_no_matches
+    File.write(File.join(@workspace, "a.txt"), "binary\0")
+    File.write(File.join(@workspace, "b.txt"), "needle")
+    with_workspace_tool_limit(:MAX_SCAN_ENTRIES, 1) do |tools|
+      result = tools.search_files(".", "missing", "**/*", 0)
+      assert_empty result["matches"]
+      assert result["scan_truncated"]
+      assert result["truncated"]
+      assert_nil result["next_offset"]
+      assert_equal 1, result["scanned_entries"]
+    end
+    with_workspace_tool_limit(:MAX_SEARCH_BYTES, 8) do |tools|
+      result = tools.search_files(".", "needle", "**/*", 0)
+      assert_empty result["matches"]
+      assert result["scan_truncated"], "Binary reads must also consume the byte budget"
+      assert_equal 1, result["skipped_files"]
+    end
+  end
+
+  def test_batched_reads_share_budget_keep_per_file_errors_and_preserve_literal_paths
+    paths = 8.times.map { |index| "page#{index}.txt" }
+    paths.each { |path| File.write(File.join(@workspace, path), "café\n" * 2000) }
+    result = call("read_files", files: paths.map { |path| { path: path, start_line: 2, max_lines: 2000 } })
+    assert_equal paths, result["files"].map { |file| file["path"] }
+    assert_operator result["files"].sum { |file| file["content"].bytesize }, :<=, CodingAgent::WorkspaceTools::MAX_OUTPUT_BYTES
+    result["files"].each do |file|
+      assert file["content"].start_with?("2: café\n")
+      assert_equal file["returned_lines"] + 2, file["next_line"]
+      assert_equal Digest::SHA256.file(File.join(@workspace, file["path"])).hexdigest, file["sha256"]
+    end
+    name = '$(touch escaped) quote".txt'
+    File.write(File.join(@workspace, name), "literal")
+    mixed = call("read_files", files: [{ path: "../outside" }, { path: name }, { path: name, max_lines: nil }])
+    assert mixed["files"][0].key?("error")
+    assert_equal "1: literal", mixed["files"][1]["content"]
+    assert mixed["files"][2].key?("error")
+    refute File.exist?(File.join(@workspace, "escaped"))
+    assert call("read_files", files: []).key?("error")
+    assert call("read_files", files: Array.new(9) { { path: name } }).key?("error")
+  end
+
+  def test_batch_edits_validate_every_edit_before_writing_and_guard_retries
+    path = File.join(@workspace, "edit.rb")
+    File.write(path, "alpha beta\n")
+    File.chmod(0o751, path)
+    sha256 = Digest::SHA256.file(path).hexdigest
+    edits = [{ old_text: "alpha", new_text: "gamma" }, { old_text: "missing", new_text: "delta" }]
+    result = call("edit_file_batch", path: "edit.rb", expected_sha256: sha256, edits: edits)
+    assert_includes result["error"], "Edit 2"
+    assert_equal "alpha beta\n", File.read(path)
+    edits[1][:old_text] = "beta"
+    result = call("edit_file_batch", path: "edit.rb", expected_sha256: sha256, edits: edits)
+    assert_equal "gamma delta\n", File.read(path)
+    assert_equal 2, result["edits_applied"]
+    assert_equal Digest::SHA256.file(path).hexdigest, result["sha256"]
+    assert_equal 0o751, File.stat(path).mode & 0o777
+    assert_equal ["edit.rb"], Dir.children(@workspace)
+    retry_result = call("edit_file_batch", path: "edit.rb", expected_sha256: sha256, edits: edits)
+    assert_includes retry_result["error"], "File changed"
+    assert_equal "gamma delta\n", File.read(path)
+  end
+
+  def test_batch_edits_reject_invalid_ambiguous_oversized_and_symlink_changes
+    path = File.join(@workspace, "edit.txt")
+    File.write(path, "same same\n")
+    sha256 = Digest::SHA256.file(path).hexdigest
+    [[], [{ old_text: "", new_text: "x" }], [{ old_text: "same", new_text: "x" }],
+     [{ old_text: "same same", new_text: nil }],
+     [{ old_text: "same same", new_text: "x" * CodingAgent::WorkspaceTools::MAX_FILE_BYTES }]].each do |edits|
+      result = call("edit_file_batch", path: "edit.txt", expected_sha256: sha256, edits: edits)
+      assert result.key?("error"), result.inspect
+      assert_equal "same same\n", File.read(path)
+    end
+    File.symlink(path, File.join(@workspace, "link.txt"))
+    assert call("edit_file_batch", path: "link.txt", expected_sha256: sha256,
+                edits: [{ old_text: "same same", new_text: "changed" }]).key?("error")
+    assert_equal "same same\n", File.read(path)
+  end
+
+  class FakePersistentHTTP
+    attr_accessor :use_ssl, :open_timeout, :read_timeout, :keep_alive_timeout
+    attr_reader :starts, :finishes, :requests
+
+    def initialize(responses)
+      @responses = responses
+      @starts = @finishes = 0
+      @requests = []
+      @started = false
+    end
+
+    def start
+      @starts += 1
+      @started = true
+    end
+
+    def started?
+      @started
+    end
+
+    def finish
+      @finishes += 1
+      @started = false
+    end
+
+    def request(request)
+      @requests << request
+      response = @responses.shift
+      raise response if response.is_a?(Exception)
+
+      response
+    end
+  end
+
+  # Minitest 6 no longer bundles Object#stub. Keep constructor replacement local
+  # to these offline tests and restore inherited constructors without shadowing.
+  def with_constructor(klass, replacement)
+    singleton = klass.singleton_class
+    owned = singleton.instance_methods(false).include?(:new)
+    original = singleton.instance_method(:new) if owned
+    singleton.send(:remove_method, :new) if owned
+    singleton.send(:define_method, :new, replacement)
+    yield
+  ensure
+    singleton.send(:remove_method, :new)
+    singleton.send(:define_method, :new, original) if owned
+  end
+
+  def test_openrouter_reuses_and_closes_its_http_connection
+    http = FakePersistentHTTP.new([final_response, final_response])
+    router = CodingAgent::OpenRouter.new(api_key: "test")
+    with_constructor(Net::HTTP, ->(*) { http }) do
+      2.times { router.complete(messages: [{ "role" => "user", "content" => "Inspect" }]) }
+      assert_equal 1, http.starts
+      assert_equal 2, http.requests.length
+      assert_equal true, http.use_ssl
+      assert_equal 120, http.keep_alive_timeout
+      router.close
+      router.close
+      assert_equal 1, http.finishes
+    end
+  end
+
+  def test_connection_failures_close_the_socket_and_allow_a_fresh_connection
+    broken = FakePersistentHTTP.new([Net::ReadTimeout.new])
+    healthy = FakePersistentHTTP.new([final_response])
+    connections = [broken, healthy]
+    router = CodingAgent::OpenRouter.new(api_key: "test")
+    with_constructor(Net::HTTP, ->(*) { connections.shift }) do
+      assert_raises(CodingAgent::Error) { router.complete(messages: []) }
+      assert_equal 1, broken.finishes
+      assert_equal "Done.", router.complete(messages: [])["content"]
+      assert_equal 1, healthy.starts
+      router.close
+      assert_equal 1, healthy.finishes
+    end
+  end
+
+  def test_cli_closes_the_router_on_success_and_failure
+    [final_response("FINAL: Done."), -> { raise Net::ReadTimeout }].each do |response|
+      router = ScriptedOpenRouter.new([response])
+      closed = false
+      router.define_singleton_method(:close) { closed = true }
+      with_constructor(CodingAgent::OpenRouter, ->(*) { router }) do
+        status = CodingAgent.run_cli(["--workspace", @workspace, "Inspect"], env: {}, output: @output, log: @log)
+        assert_equal response.respond_to?(:call) ? 1 : 0, status
+      end
+      assert closed
+    end
   end
 end
