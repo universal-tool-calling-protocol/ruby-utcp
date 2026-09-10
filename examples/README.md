@@ -17,6 +17,19 @@ Each official transport has a client example. Network transports include a match
 | MCP | `mcp.rb` | `servers/mcp_stdio_server.rb`, launched by the client |
 | Text | `text.rb` | self-contained |
 
+## Coding agent
+
+[`coding_agent.rb`](coding_agent.rb) is a terminal coding agent with OpenRouter-compatible
+LLM calls, UTCP workspace tools, approval-gated edits and commands, and optional Code Mode.
+See the [coding-agent guide](coding_agent/README.md) for setup, security limits, and tests.
+It requires a tool-capable model and is intentionally not part of unattended `make demo` runs.
+
+```sh
+export OPENROUTER_API_KEY='your-key'
+export OPENROUTER_MODEL='your-tool-capable-model-id'
+ruby -Ilib examples/coding_agent.rb --workspace /path/to/project --codemode
+```
+
 ## Code Mode
 
 `code_mode.rb` uses `CodeModeUtcpClient` to discover a tool, call it twice through `codemode.call_tool`, transform both responses inside the constrained Ruby runtime, and print the result with captured logs. It reuses the HTTP example server:
