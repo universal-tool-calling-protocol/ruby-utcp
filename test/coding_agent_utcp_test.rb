@@ -13,7 +13,8 @@ class CodingAgentUTCPTest < Minitest::Test
       source = <<~'CODE'
         require "json"
         require "utcp"
-        require_relative "examples/coding_agent/utcp_workspace"
+        # Ruby 2.6/2.7 cannot infer a require_relative basepath inside ruby -e.
+        require File.expand_path("examples/coding_agent/utcp_workspace", Dir.pwd)
         root = ARGV.fetch(0)
         workspace = RubyUTCPAgent::Workspace.new(root: root, approve: ->(*) { true })
         client = RubyUTCPAgent::WorkspaceClient.build(workspace)
