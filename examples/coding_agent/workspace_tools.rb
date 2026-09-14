@@ -5,6 +5,7 @@ require "digest"
 require "json"
 require "open3"
 require "tempfile"
+require_relative "ruby_symbols"
 
 module CodingAgent
   # This file is also the executable behind the manual's CLI call templates.
@@ -17,6 +18,10 @@ module CodingAgent
     MAX_BATCH_EDITS = 50
     MAX_SCAN_ENTRIES = 20_000
     MAX_SEARCH_BYTES = 32 * 1024 * 1024
+    MAX_PATTERN_BYTES = 1024
+    GREP_MATCH_TIMEOUT = 0.05
+    GREP_TIMEOUT = 2
+    UNKNOWN_FINGERPRINT = false
     HIDDEN_DIRECTORIES = %w[.git .bundle node_modules vendor .venv].freeze
     PATH_INPUT = { "type" => "string", "description" => "Path relative to the workspace; use . for its root." }.freeze
     TEXT_INPUT = { "type" => "string" }.freeze
@@ -40,6 +45,17 @@ module CodingAgent
       },
       "search_files" => {
         "description" => "Search UTF-8 files recursively for literal, case-sensitive query text. Returns matching lines with workspace-relative paths and line numbers. Use path '.', glob '**/*', offset 0; follow next_offset. Bounded scan skips dependency directories, symlinks, binary and oversized files; inspect skipped_files and scan_truncated.",
+        "properties" => { "path" => PATH_INPUT, "query" => TEXT_INPUT, "glob" => TEXT_INPUT,
+                          "offset" => { "type" => "integer", "minimum" => 0 } }
+      },
+      "grep" => {
+        "description" => "Search text files with a Ruby regular expression (Ruby 3.2+). Returns one match per line with path, line number and excerpt. path accepts a file or directory. Use glob '*.rb', ignore_case false, offset 0; follow next_offset. Matching is time-limited; narrow the path/glob or simplify the pattern on timeout. Use search_files for literal text.",
+        "properties" => { "path" => PATH_INPUT, "pattern" => TEXT_INPUT, "glob" => TEXT_INPUT,
+                          "ignore_case" => { "type" => "boolean" },
+                          "offset" => { "type" => "integer", "minimum" => 0 } }
+      },
+      "symbols" => {
+        "description" => "Find Ruby class, module, method and constant declarations using the parser, without running source. Returns names, lexical qualified names, kinds, paths and one-based lines. path accepts a file or directory. Use query '' for all or a case-sensitive name substring, glob '*.rb', offset 0; follow next_offset. Supports .rb/.rake/.gemspec/.ru, Gemfile and Rakefile. Check parse_errors, unsupported_files, skipped_files and scan_truncated; dynamic definitions are not indexed. Use grep for references or other languages.",
         "properties" => { "path" => PATH_INPUT, "query" => TEXT_INPUT, "glob" => TEXT_INPUT,
                           "offset" => { "type" => "integer", "minimum" => 0 } }
       },
@@ -75,6 +91,18 @@ module CodingAgent
             "items" => { "type" => "object", "properties" => { "old_text" => TEXT_INPUT, "new_text" => TEXT_INPUT },
                          "required" => %w[old_text new_text], "additionalProperties" => false } } }
       },
+      "rewrite_file" => {
+        "description" => "Atomically replace an existing UTF-8 file with new content, preserving permissions. Requires expected_sha256 from a read or repository snapshot. For long content, use a draft with append_file and commit_file instead.",
+        "properties" => { "path" => PATH_INPUT, "content" => TEXT_INPUT, "expected_sha256" => TEXT_INPUT }
+      },
+      "move_file" => {
+        "description" => "Move or rename one UTF-8 file, creating parent directories and preserving permissions. Requires the source expected_sha256. Refuses to overwrite any destination. Update references separately and inspect each result.",
+        "properties" => { "path" => PATH_INPUT, "destination_path" => PATH_INPUT, "expected_sha256" => TEXT_INPUT }
+      },
+      "delete_file" => {
+        "description" => "Delete one UTF-8 file after reading it. Requires its expected_sha256; a changed file is left intact. Does not delete directories.",
+        "properties" => { "path" => PATH_INPUT, "expected_sha256" => TEXT_INPUT }
+      },
       "run_command" => {
         "description" => "Run a shell command in the workspace (for example, tests or git diff). Returns exit_code and bounded output. Times out after 60 seconds.",
         "properties" => { "command" => TEXT_INPUT }
@@ -109,6 +137,56 @@ module CodingAgent
       read_page(path, start_line, max_lines, MAX_OUTPUT_BYTES)
     end
 
+    # Host-side context loading uses the same path and text checks as tools,
+    # without line prefixes or the per-tool output-page limit.
+    def read_snapshot(path)
+      content = read_text(workspace_path(path))
+      { "path" => path, "content" => content, "sha256" => Digest::SHA256.hexdigest(content) }
+    end
+
+    def file_fingerprint(path)
+      destination = workspace_path(path)
+      begin
+        stat = File.lstat(destination)
+      rescue Errno::ENOENT
+        return nil
+      end
+      raise ArgumentError, "Expected a regular file" unless stat.file?
+      raise ArgumentError, "File exceeds 256 KiB" if stat.size > MAX_FILE_BYTES
+
+      content = File.binread(destination, MAX_FILE_BYTES + 1) || +""
+      raise ArgumentError, "File exceeds 256 KiB" if content.bytesize > MAX_FILE_BYTES
+
+      Digest::SHA256.hexdigest(content)
+    end
+
+    # Host-side change tracking only: no file contents are sent to the model.
+    # false marks a file whose fingerprint could not be established; nil is
+    # reserved for a path that is known not to exist.
+    def workspace_fingerprints
+      files = {}
+      bytes = 0
+      state = { "scan_truncated" => false, "skipped_files" => 0, "scanned_entries" => 0 }
+      each_workspace_file(@root, state) do |absolute, _relative|
+        begin
+          size = File.size(absolute)
+          if size > MAX_FILE_BYTES
+            files[absolute] = UNKNOWN_FINGERPRINT
+            next
+          end
+          if bytes + size > MAX_SEARCH_BYTES
+            state["scan_truncated"] = true
+            break
+          end
+          bytes += size
+          files[absolute] = file_fingerprint(absolute)
+        rescue ArgumentError, SystemCallError
+          files[absolute] = UNKNOWN_FINGERPRINT
+        end
+      end
+      { "files" => files, "complete" => !state["scan_truncated"] && state["skipped_files"].zero? }
+    end
+
     def read_files(files)
       requests = array_argument(files, MAX_BATCH_FILES, "files")
       budget = MAX_OUTPUT_BYTES / requests.length
@@ -136,7 +214,73 @@ module CodingAgent
         raise ArgumentError, "query must be nonempty literal text on one line"
       end
 
-      scan_files(path, glob, offset, query)
+      scan_files(path, glob, offset, "matches") do |text, relative, accept|
+        text.each_line.with_index(1) do |line, number|
+          position = line.index(query)
+          accept.call(matching_line(relative, line, number, position)) if position
+        end
+      end
+    end
+
+    def grep(path, pattern, glob, ignore_case, offset)
+      unless pattern.is_a?(String) && !pattern.empty? && pattern.bytesize <= MAX_PATTERN_BYTES &&
+             !pattern.include?("\n") && !pattern.include?("\0")
+        raise ArgumentError, "pattern must be a nonempty, single-line regex of at most #{MAX_PATTERN_BYTES} bytes"
+      end
+      unless [true, false, "true", "false"].include?(ignore_case)
+        raise ArgumentError, "ignore_case must be true or false"
+      end
+      # Older Ruby regex engines cannot interrupt every pathological pattern.
+      # Keep literal search available there instead of accepting an unbounded regex.
+      unless Regexp.respond_to?(:timeout)
+        raise ArgumentError, "grep requires Ruby 3.2+ for regex timeouts; use search_files for literal text"
+      end
+      flags = [true, "true"].include?(ignore_case) ? Regexp::IGNORECASE : 0
+      begin
+        expression = Regexp.new(pattern, flags, timeout: GREP_MATCH_TIMEOUT)
+      rescue RegexpError => error
+        raise ArgumentError, "Invalid grep pattern: #{error.message}"
+      end
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + GREP_TIMEOUT
+      begin
+        scan_files(path, glob, offset, "matches") do |text, relative, accept|
+          text.each_line.with_index(1) do |line, number|
+            if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+              raise ArgumentError, "grep search timed out; narrow the path/glob or simplify the pattern"
+            end
+            match = expression.match(line)
+            accept.call(matching_line(relative, line, number, match.begin(0))) if match
+          end
+        end
+      rescue Regexp::TimeoutError
+        raise ArgumentError, "grep match timed out; simplify the pattern"
+      end
+    end
+
+    def symbols(path, query, glob, offset)
+      unless query.is_a?(String) && query.bytesize <= MAX_PATTERN_BYTES && !query.include?("\n") && !query.include?("\0")
+        raise ArgumentError, "query must be single-line literal text of at most #{MAX_PATTERN_BYTES} bytes (or empty for all symbols)"
+      end
+      stats = { "parse_errors" => 0, "unsupported_files" => 0 }
+      filter = lambda do |relative|
+        supported = %w[.rb .rake .gemspec .ru].include?(File.extname(relative)) ||
+                    %w[Gemfile Rakefile].include?(File.basename(relative))
+        stats["unsupported_files"] += 1 unless supported
+        supported
+      end
+      result = scan_files(path, glob, offset, "symbols", file_filter: filter) do |text, relative, accept|
+        begin
+          RubySymbols.each(text) do |symbol|
+            next unless symbol.fetch("qualified_name").include?(query)
+
+            accept.call(symbol.merge("path" => relative))
+          end
+        rescue RubySymbols::ParseError
+          stats["parse_errors"] += 1
+        end
+      end
+      result["skipped_files"] += stats["parse_errors"]
+      result.merge(stats)
     end
 
     def edit_file_batch(path, expected_sha256, edits)
@@ -160,18 +304,35 @@ module CodingAgent
         end
       end
 
-      Tempfile.create([".coding-agent-", ".tmp"], File.dirname(destination)) do |file|
-        file.binmode
-        file.write(updated)
-        file.flush
-        File.chmod(File.stat(destination).mode & 0o777, file.path)
-        unless read_text(workspace_path(path)) == original
-          raise ArgumentError, "File changed while preparing edits; read it again"
-        end
-        File.rename(file.path, destination)
-      end
+      atomic_replace(path, destination, original, updated)
       { "path" => path, "edits_applied" => replacements.length, "bytes_written" => updated.bytesize,
         "sha256" => Digest::SHA256.hexdigest(updated) }
+    end
+
+    def rewrite_file(path, content, expected_sha256)
+      validate_text!(content)
+      destination, original = checked_file(path, expected_sha256)
+      atomic_replace(path, destination, original, content)
+      { "path" => path, "bytes_written" => content.bytesize, "sha256" => Digest::SHA256.hexdigest(content) }
+    end
+
+    def move_file(path, destination_path, expected_sha256)
+      source, content = checked_file(path, expected_sha256)
+      destination = workspace_path(destination_path)
+      raise ArgumentError, "Destination already exists" if File.exist?(destination)
+
+      FileUtils.mkdir_p(File.dirname(destination))
+      # link fails atomically if the destination exists; rename would overwrite
+      # a file created after the existence check. Cross-device moves fail intact.
+      File.link(source, destination)
+      File.unlink(source)
+      { "path" => path, "destination_path" => destination_path, "sha256" => Digest::SHA256.hexdigest(content) }
+    end
+
+    def delete_file(path, expected_sha256)
+      destination, = checked_file(path, expected_sha256)
+      File.unlink(destination)
+      { "path" => path, "deleted" => true }
     end
 
     def read_page(path, start_line, max_lines, budget)
@@ -219,7 +380,7 @@ module CodingAgent
       total = nil
       File.open(destination, "r+b") do |file|
         file.flock(File::LOCK_EX)
-        current = file.read(MAX_FILE_BYTES + 1).force_encoding(Encoding::UTF_8)
+        current = (file.read(MAX_FILE_BYTES + 1) || +"").force_encoding(Encoding::UTF_8)
         validate_text!(current)
         unless current.bytesize == Integer(expected_bytes)
           raise ArgumentError, "File size changed; read the draft before retrying this append"
@@ -252,8 +413,8 @@ module CodingAgent
       destination = workspace_path(path)
       content = read_text(destination)
       updated = replace_text(content, old_text, new_text)
-      File.binwrite(destination, updated)
-      { "path" => path, "bytes_written" => updated.bytesize }
+      atomic_replace(path, destination, content, updated)
+      { "path" => path, "bytes_written" => updated.bytesize, "sha256" => Digest::SHA256.hexdigest(updated) }
     end
 
     def run_command(command)
@@ -282,6 +443,28 @@ module CodingAgent
 
     private
 
+    def checked_file(path, expected_sha256)
+      destination = workspace_path(path)
+      content = read_text(destination)
+      unless Digest::SHA256.hexdigest(content) == expected_sha256
+        raise ArgumentError, "File changed; read it again before modifying it"
+      end
+      [destination, content]
+    end
+
+    def atomic_replace(path, destination, original, updated)
+      Tempfile.create([".coding-agent-", ".tmp"], File.dirname(destination)) do |file|
+        file.binmode
+        file.write(updated)
+        file.flush
+        File.chmod(File.stat(destination).mode & 0o777, file.path)
+        unless read_text(workspace_path(path)) == original
+          raise ArgumentError, "File changed while preparing edits; read it again"
+        end
+        File.rename(file.path, destination)
+      end
+    end
+
     def array_argument(value, limit, name)
       value = JSON.parse(value) if value.is_a?(String)
       unless value.is_a?(Array) && (1..limit).cover?(value.length)
@@ -303,9 +486,20 @@ module CodingAgent
       updated
     end
 
-    def scan_files(path, glob, offset, query = nil)
-      directory = workspace_path(path)
-      raise ArgumentError, "Expected a directory" unless File.directory?(directory)
+    def matching_line(path, line, number, position)
+      # Show the match even when it occurs late in a very long line.
+      content = line.chomp
+      excerpt = content[[position - 120, 0].max, 1000].to_s.byteslice(0, 1000)
+                       .force_encoding(Encoding::UTF_8).scrub("")
+      { "path" => path, "line" => number, "text" => excerpt,
+        "text_truncated" => content.bytesize > excerpt.bytesize }
+    end
+
+    def scan_files(path, glob, offset, result_key = "files", file_filter: nil)
+      target = workspace_path(path)
+      unless File.directory?(target) || File.file?(target)
+        raise ArgumentError, "Expected a file or directory"
+      end
       raise ArgumentError, "glob must not be empty" unless glob.is_a?(String) && !glob.empty?
 
       offset = Integer(offset)
@@ -318,16 +512,23 @@ module CodingAgent
       searched_bytes = 0
       more = false
       catch(:page_full) do
-        each_workspace_file(directory, state) do |absolute, relative|
+        each_workspace_file(target, state) do |absolute, relative|
+          relative = File.basename(absolute) if relative.empty?
           candidate = glob.include?("/") ? relative : File.basename(relative)
           next unless File.fnmatch?(glob, candidate, File::FNM_PATHNAME | File::FNM_EXTGLOB | File::FNM_DOTMATCH)
 
           workspace_relative = absolute.delete_prefix(@root.end_with?("/") ? @root : @root + "/")
+          if file_filter && !file_filter.call(workspace_relative)
+            state["skipped_files"] += 1
+            next
+          end
           accept = lambda do |item|
             matched += 1
             next if matched <= offset
 
             size = JSON.generate(item).bytesize + 1
+            raise ArgumentError, "A search result exceeds 32 KiB; read the file directly" if size + 2 > MAX_OUTPUT_BYTES
+
             if results.length >= MAX_ENTRIES || output_bytes + size > MAX_OUTPUT_BYTES
               more = true
               throw :page_full
@@ -335,7 +536,7 @@ module CodingAgent
             results << item
             output_bytes += size
           end
-          unless query
+          unless block_given?
             accept.call(workspace_relative)
             next
           end
@@ -357,19 +558,10 @@ module CodingAgent
             state["skipped_files"] += 1
             next
           end
-          text.each_line.with_index(1) do |line, number|
-            position = line.index(query)
-            next unless position
-
-            # Show the match even when it occurs late in a very long line.
-            excerpt = line.chomp[[position - 120, 0].max, 1000].byteslice(0, 1000)
-                          .force_encoding(Encoding::UTF_8).scrub("")
-            accept.call({ "path" => workspace_relative, "line" => number, "text" => excerpt,
-                          "text_truncated" => line.chomp.bytesize > excerpt.bytesize })
-          end
+          yield text, workspace_relative, accept
         end
       end
-      state.merge((query ? "matches" : "files") => results, "truncated" => more || state["scan_truncated"],
+      state.merge(result_key => results, "truncated" => more || state["scan_truncated"],
                   "next_offset" => more ? offset + results.length : nil)
     end
 
@@ -430,7 +622,7 @@ module CodingAgent
     def read_text(path)
       raise ArgumentError, "Expected a regular file" unless File.file?(path)
 
-      content = File.binread(path, MAX_FILE_BYTES + 1).force_encoding(Encoding::UTF_8)
+      content = (File.binread(path, MAX_FILE_BYTES + 1) || +"").force_encoding(Encoding::UTF_8)
       validate_text!(content)
       content
     end

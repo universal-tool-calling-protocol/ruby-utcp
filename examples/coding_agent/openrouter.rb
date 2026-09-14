@@ -2,6 +2,7 @@
 
 require "json"
 require "net/http"
+require "timeout"
 require "uri"
 
 module CodingAgent
@@ -18,19 +19,29 @@ module CodingAgent
   end
 
   class OpenRouter
+    class RequestDeadlineExceeded < StandardError; end
+
     DEFAULT_MODEL = "inception/mercury-2.5"
-    DEFAULT_MAX_TOKENS = 60000
+    DEFAULT_MAX_TOKENS = 4096
+    DEFAULT_REQUEST_TIMEOUT = 60
+    PROGRESS_INTERVAL = 5
     ENDPOINT = URI("https://openrouter.ai/api/v1/chat/completions")
     RETRYABLE_STATUSES = [408, 429, 500, 502, 503, 504].freeze
 
-    def initialize(api_key:, model: DEFAULT_MODEL, max_tokens: DEFAULT_MAX_TOKENS, sleeper: Kernel.method(:sleep))
+    def initialize(api_key:, model: DEFAULT_MODEL, max_tokens: DEFAULT_MAX_TOKENS,
+                   request_timeout: DEFAULT_REQUEST_TIMEOUT, log: nil, sleeper: Kernel.method(:sleep))
       raise Error, "Set OPENROUTER_API_KEY to your OpenRouter API key" if api_key.to_s.strip.empty?
       raise Error, "Provide a nonempty OpenRouter model ID" unless model.is_a?(String) && !model.strip.empty?
       raise Error, "max_tokens must be positive" unless max_tokens.is_a?(Integer) && max_tokens.positive?
+      unless request_timeout.is_a?(Numeric) && request_timeout.positive? && request_timeout.to_f.finite?
+        raise Error, "request_timeout must be a finite positive number"
+      end
 
       @api_key = api_key
       @model = model
       @max_tokens = max_tokens
+      @request_timeout = request_timeout
+      @log = log
       @sleeper = sleeper
     end
 
@@ -43,6 +54,29 @@ module CodingAgent
     end
 
     def complete(messages:, tools: nil)
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      result = with_progress do
+        # Net::HTTP read_timeout limits each read. This deadline also covers
+        # steadily arriving bytes, connection setup, and every retry/backoff.
+        Timeout.timeout(@request_timeout, RequestDeadlineExceeded) do
+          perform_completion(messages: messages, tools: tools)
+        end
+      end
+      progress("Model response received after #{format('%.1f', elapsed_since(started))}s")
+      result
+    rescue RequestDeadlineExceeded
+      close
+      raise Error, "OpenRouter request exceeded #{@request_timeout}s, including retries. " \
+                   "No program from this request was executed. Use a smaller --max-tokens value, " \
+                   "try another model, or increase --request-timeout"
+    rescue Interrupt
+      close
+      raise
+    end
+
+    private
+
+    def perform_completion(messages:, tools:)
       request = Net::HTTP::Post.new(ENDPOINT)
       request["Authorization"] = "Bearer #{@api_key}"
       request["Content-Type"] = "application/json"
@@ -75,7 +109,9 @@ module CodingAgent
         if error && RETRYABLE_STATUSES.include?(error.code) && attempt < 2
           retry_after = response["Retry-After"].to_s
           delay = retry_after.match?(/\A\d+\z/) ? retry_after.to_i : 2**(attempt + 1)
-          @sleeper.call([delay, 30].min)
+          delay = [delay, 30].min
+          progress("OpenRouter returned #{error.code}; retry #{attempt + 1}/2 in #{delay}s")
+          @sleeper.call(delay)
           next
         end
         raise error if error
@@ -98,7 +134,42 @@ module CodingAgent
       raise Error, "OpenRouter connection failed (#{error.class}); try again later"
     end
 
-    private
+    def with_progress
+      return yield unless @log
+
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      progress("Waiting for #{@model} (#{@max_tokens} output tokens max, #{@request_timeout}s request deadline)")
+      lock = Mutex.new
+      signal = ConditionVariable.new
+      finished = false
+      reporter = Thread.new do
+        lock.synchronize do
+          until finished
+            signal.wait(lock, PROGRESS_INTERVAL)
+            break if finished
+
+            progress("Still waiting for model response (#{elapsed_since(started).to_i}s elapsed)")
+          end
+        end
+      end
+      yield
+    ensure
+      if reporter
+        lock.synchronize { finished = true; signal.signal }
+        reporter.join
+      end
+    end
+
+    def elapsed_since(started)
+      Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+    end
+
+    def progress(message)
+      return unless @log
+
+      @log.puts(message)
+      @log.flush
+    end
 
     def response_error(response, data)
       status = response.code.to_i
@@ -138,8 +209,9 @@ module CodingAgent
       unless @http
         @http = Net::HTTP.new(ENDPOINT.host, ENDPOINT.port)
         @http.use_ssl = true
-        @http.open_timeout = 10
-        @http.read_timeout = 120
+        @http.open_timeout = [10, @request_timeout].min
+        @http.read_timeout = @request_timeout
+        @http.write_timeout = @request_timeout if @http.respond_to?(:write_timeout=)
         @http.keep_alive_timeout = 120
       end
       @http.start unless @http.started?
